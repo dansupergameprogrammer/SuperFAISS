@@ -9,9 +9,12 @@ namespace
 {
 
 // The subnormal-floor contract, reproduced file-local per this codebase's shipped
+// convention. The name carries the file: novelty.cpp defines the same helper, and the
+// plugin vendors every core .cpp into ONE translation unit, where two file-local helpers
+// sharing a name collide (C2084) even though each compiles cleanly on its own here.
 // file-local-epilogue convention (see analytics.cpp's own XdFloor, applied to every
 // CrossDevice reduction): |score| < FLT_MIN -> exactly 0.0f, on every machine.
-inline float XdFloorLocal(double score)
+inline float XdFloorDiversityLocal(double score)
 {
 	const double lim = 1.1754943508222875e-38; // FLT_MIN, exactly
 	if (score < lim && score > -lim)
@@ -71,7 +74,7 @@ Status SelectDiverseMMR(
 					}
 					acc += static_cast<double>(pairScore);
 				}
-				redundancy = XdFloorLocal(acc / static_cast<double>(step));
+				redundancy = XdFloorDiversityLocal(acc / static_cast<double>(step));
 			}
 
 			const float relevance = candidates[pos].score;
