@@ -8,9 +8,10 @@
 // epsilon boundary check rather than exact rank equality.
 
 #include "superfaiss/superfaiss.h"
-#include "superfaiss/graph.h"    // V3.2 M1 (Bank Inspector I)
-#include "superfaiss/novelty.h"  // V3.2 M2
-#include "superfaiss/matching.h" // V3.2 M3
+#include "superfaiss/graph.h"     // V3.2 M1 (Bank Inspector I)
+#include "superfaiss/novelty.h"   // V3.2 M2
+#include "superfaiss/matching.h"  // V3.2 M3
+#include "superfaiss/diversity.h" // V3.4 diversity
 
 #include "xd_fixtures.h"
 
@@ -18277,14 +18278,16 @@ static void TestAllocFlatGraphAndNoveltyMisc()
 // (superfaiss-allocation-seam-coverage-audit.md §11) says its arithmetic was
 // not verified by execution and that the correct order is "write the
 // extractor, run it, reconcile ... and pin whatever it actually produces" --
-// this registry is that reconciliation. It sums to 157 entry points (153
+// this registry is that reconciliation. It summed to 157 entry points (153
 // registry rows; Create's three overloads and Freeze's two collapse into one
-// row each, tallied by the `overloads` field), which matches the audit's own
-// stated total (§1) once kernels.h's `detail::` namespace is counted
-// correctly at 23 symbols -- the audit's own §4.8 prose said "22" while its
-// own comma-separated list in the same paragraph names 23, an internal
+// row each, tallied by the `overloads` field) at the audit's own stated total
+// (§1) once kernels.h's `detail::` namespace is counted correctly at 23
+// symbols -- the audit's own §4.8 prose said "22" while its own
+// comma-separated list in the same paragraph names 23, an internal
 // contradiction caught only by running the extractor and reconciling against
 // the header text itself, exactly the failure mode ceiling #4 warns about.
+// V3.4 added one entry point (diversity.h's SelectDiverseMMR), bringing the
+// total to 158 entry points across 154 registry rows.
 // ===========================================================================
 
 namespace
@@ -18352,6 +18355,8 @@ namespace
 		{"analytics.h", "MaxNNCrossDeviceChannel", AllocBinding::Binds, "TestAllocFlatAnalyticsChannel", 1},
 		{"analytics.h", "SpreadCrossDeviceChannel", AllocBinding::Binds, "TestAllocFlatAnalyticsChannel", 1},
 		{"analytics.h", "ProjectionReport", AllocBinding::Binds, "TestAllocFlatProjectionReport", 1},
+		// --- diversity.h (1 entry point) ---
+		{"diversity.h", "SelectDiverseMMR", AllocBinding::Binds, "TestAllocFlatDiversity", 1},
 
 		// --- bake.h (5 entry points, all Binds) ---
 		{"bake.h", "NormalizeRows", AllocBinding::Binds, "TestAllocFlatBakeAndPca", 1},
@@ -18523,7 +18528,7 @@ namespace
 	struct HeaderExpectedCount { const char* header; int count; };
 	const HeaderExpectedCount kHeaderExpectedCounts[] = {
 		{"alloc.h", 26}, {"analytics.h", 10}, {"bake.h", 5}, {"compose.h", 4},
-		{"graph.h", 4}, {"inspector_common.h", 1}, {"kernels.h", 36},
+		{"diversity.h", 1}, {"graph.h", 4}, {"inspector_common.h", 1}, {"kernels.h", 36},
 		{"matching.h", 1}, {"novelty.h", 4}, {"pca.h", 2}, {"query.h", 5},
 		{"scratch.h", 41}, {"superfaiss.h", 0}, {"topk.h", 6}, {"types.h", 8},
 		{"validate.h", 5}, {"version.h", 0},
@@ -19854,6 +19859,286 @@ static void TestS1FlatAllocationMutualNearestMatches()
 	}
 }
 
+// ---------------------------------------------------------------------------
+// V3.4 -- diversity (drift-and-diversity plan section 6): greedy MMR selection.
+
+// Builds `count` single-row XdQuery payloads (bank rows [0, count)) via
+// MakeCentroidCrossDevice with a one-row selection -- the same construction the flat-
+// allocation XdQuery-batch fixture already uses (TestAllocFlatQueryXdBatch) -- so every
+// payload passes ScoreXdPair's payload law (scale finite/non-negative, self-dot recomputed
+// and matched).
+static void BuildRowQueries(const BankView& bank, int32_t count,
+	std::vector<std::vector<int8_t>>& images, std::vector<XdQuery>& queries)
+{
+	images.assign(static_cast<size_t>(count), std::vector<int8_t>());
+	queries.assign(static_cast<size_t>(count), XdQuery{});
+	for (int32_t i = 0; i < count; ++i)
+	{
+		AlignedBuf q8(static_cast<size_t>(bank.paddedDims));
+		double scale = 0.0;
+		int64_t sqSum = 0;
+		CHECK(MakeCentroidCrossDevice(bank, &i, 1, nullptr, nullptr, q8.I8(), &scale, &sqSum) ==
+			Status::Ok);
+		images[static_cast<size_t>(i)].assign(q8.I8(), q8.I8() + bank.paddedDims);
+		queries[static_cast<size_t>(i)] =
+			XdQuery{images[static_cast<size_t>(i)].data(), scale, sqSum};
+	}
+}
+
+// Independent recode of the greedy MMR loop -- an oracle built on the already-trusted
+// ScoreXdPair primitive (not a re-test of ScoreXdPair itself), mirroring
+// SelectDiverseMMR's own spec (mean redundancy over already-selected members in selection
+// order, step-0 redundancy exactly 0, argmax with ascending-Hit.index tie-break) without
+// sharing any code with src/diversity.cpp.
+static Status RefSelectDiverseMMR(
+	const Hit* candidates, const XdQuery* candidateQueries, int32_t candidateCount,
+	int32_t paddedDims, Metric metric, float lambda, int32_t k,
+	int32_t* outSelectedIndices, float* outRelevance, float* outRedundancy)
+{
+	const double lim = 1.1754943508222875e-38; // FLT_MIN, exactly -- the subnormal floor.
+	std::vector<bool> selected(static_cast<size_t>(candidateCount), false);
+	for (int32_t step = 0; step < k; ++step)
+	{
+		int32_t bestPos = -1;
+		float bestScore = 0.0f;
+		float bestRelevance = 0.0f;
+		float bestRedundancy = 0.0f;
+		for (int32_t pos = 0; pos < candidateCount; ++pos)
+		{
+			if (selected[static_cast<size_t>(pos)])
+			{
+				continue;
+			}
+			double acc = 0.0;
+			for (int32_t s = 0; s < step; ++s)
+			{
+				float pair = 0.0f;
+				const Status st = ScoreXdPair(candidateQueries[pos],
+					candidateQueries[outSelectedIndices[s]], paddedDims, metric, &pair);
+				if (st != Status::Ok)
+				{
+					return st;
+				}
+				acc += static_cast<double>(pair);
+			}
+			float redundancy = 0.0f;
+			if (step > 0)
+			{
+				const double mean = acc / static_cast<double>(step);
+				redundancy = (mean < lim && mean > -lim) ? 0.0f : static_cast<float>(mean);
+			}
+			const float relevance = candidates[pos].score;
+			const float score = lambda * relevance - (1.0f - lambda) * redundancy;
+			if (bestPos == -1 || score > bestScore ||
+				(score == bestScore && candidates[pos].index < candidates[bestPos].index))
+			{
+				bestPos = pos;
+				bestScore = score;
+				bestRelevance = relevance;
+				bestRedundancy = redundancy;
+			}
+		}
+		outSelectedIndices[step] = bestPos;
+		selected[static_cast<size_t>(bestPos)] = true;
+		outRelevance[step] = bestRelevance;
+		outRedundancy[step] = bestRedundancy;
+	}
+	return Status::Ok;
+}
+
+static void TestDiversityMMR()
+{
+	std::printf("diversity (V3.4): greedy MMR selection\n");
+
+	const Metric metrics[3] = {Metric::Dot, Metric::Cosine, Metric::L2};
+	const char* names[3] = {"dot", "cosine", "L2"};
+
+	for (int32_t m = 0; m < 3; ++m)
+	{
+		Rng rng(0xD1FE5170ull + static_cast<uint64_t>(m));
+		const int32_t dims = 16, bankCount = 24, candidateCount = 10, k = 5;
+		TestBank bank(rng, bankCount, dims, Quantization::Int8, metrics[m]);
+
+		std::vector<std::vector<int8_t>> images;
+		std::vector<XdQuery> queries;
+		BuildRowQueries(bank.view, candidateCount, images, queries);
+
+		std::vector<Hit> candidates(static_cast<size_t>(candidateCount));
+		for (int32_t i = 0; i < candidateCount; ++i)
+		{
+			// Strictly descending relevance by construction position, so a lambda=1
+			// selection's expected order is known without a separate sort.
+			candidates[static_cast<size_t>(i)] = Hit{
+				i, static_cast<float>(candidateCount - i) + 0.001f * static_cast<float>(i)};
+		}
+
+		// --- lambda == 1: reduces to relevance order, independent of redundancy, and the
+		// first-selection redundancy convention holds (exactly 0, never a reduction over
+		// zero terms).
+		{
+			std::vector<int32_t> sel(static_cast<size_t>(k), -1);
+			std::vector<float> rel(static_cast<size_t>(k), 0.0f);
+			std::vector<float> red(static_cast<size_t>(k), -1.0f);
+			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
+				bank.view.paddedDims, metrics[m], 1.0f, k, sel.data(), rel.data(), red.data()) ==
+				Status::Ok);
+			for (int32_t i = 0; i < k; ++i)
+			{
+				CHECK_MSG(sel[static_cast<size_t>(i)] == i,
+					"%s lambda=1: step %d selected pos %d, expected relevance-order pos %d",
+					names[m], i, sel[static_cast<size_t>(i)], i);
+				CHECK(rel[static_cast<size_t>(i)] == candidates[static_cast<size_t>(i)].score);
+			}
+			CHECK_MSG(red[0] == 0.0f, "%s lambda=1: step 0 redundancy %.9g != 0", names[m],
+				static_cast<double>(red[0]));
+		}
+
+		// --- lambda < 1: cross-checked against an independent recode of the same
+		// algorithm (RefSelectDiverseMMR), and the first pick is still the most-relevant
+		// candidate regardless of lambda (the spec's positive-scalar-multiple claim).
+		const float lambdas[3] = {0.0f, 0.3f, 0.7f};
+		for (int32_t li = 0; li < 3; ++li)
+		{
+			const float lambda = lambdas[li];
+			std::vector<int32_t> sel(static_cast<size_t>(k), -1);
+			std::vector<float> rel(static_cast<size_t>(k), 0.0f);
+			std::vector<float> red(static_cast<size_t>(k), -1.0f);
+			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
+				bank.view.paddedDims, metrics[m], lambda, k, sel.data(), rel.data(), red.data()) ==
+				Status::Ok);
+
+			std::vector<int32_t> refSel(static_cast<size_t>(k), -1);
+			std::vector<float> refRel(static_cast<size_t>(k), 0.0f);
+			std::vector<float> refRed(static_cast<size_t>(k), -1.0f);
+			CHECK(RefSelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
+				bank.view.paddedDims, metrics[m], lambda, k, refSel.data(), refRel.data(),
+				refRed.data()) == Status::Ok);
+
+			for (int32_t i = 0; i < k; ++i)
+			{
+				CHECK_MSG(sel[static_cast<size_t>(i)] == refSel[static_cast<size_t>(i)],
+					"%s lambda=%.2f: step %d op pos %d != ref pos %d", names[m],
+					static_cast<double>(lambda), i, sel[static_cast<size_t>(i)],
+					refSel[static_cast<size_t>(i)]);
+				CHECK(rel[static_cast<size_t>(i)] == refRel[static_cast<size_t>(i)]);
+				CHECK(red[static_cast<size_t>(i)] == refRed[static_cast<size_t>(i)]);
+			}
+			CHECK_MSG(sel[0] == 0, "%s lambda=%.2f: first pick pos %d != most-relevant pos 0",
+				names[m], static_cast<double>(lambda), sel[0]);
+			CHECK(red[0] == 0.0f);
+		}
+
+		// --- Repeat determinism: identical inputs produce bit-identical output.
+		{
+			std::vector<int32_t> selA(static_cast<size_t>(k)), selB(static_cast<size_t>(k));
+			std::vector<float> relA(static_cast<size_t>(k)), relB(static_cast<size_t>(k));
+			std::vector<float> redA(static_cast<size_t>(k)), redB(static_cast<size_t>(k));
+			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
+				bank.view.paddedDims, metrics[m], 0.5f, k, selA.data(), relA.data(),
+				redA.data()) == Status::Ok);
+			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
+				bank.view.paddedDims, metrics[m], 0.5f, k, selB.data(), relB.data(),
+				redB.data()) == Status::Ok);
+			CHECK(selA == selB);
+			CHECK(relA == relB);
+			CHECK(redA == redB);
+		}
+	}
+
+	// --- Tie-break: ascending Hit.index, never pool position (plan-temper C-6). Three
+	// equally-relevant candidates whose pool position order (7, 2, 9) is the REVERSE of
+	// their index order on the first two -- a position-based tie-break would select pool
+	// position 0 (index 7) first; the spec requires ascending index (2, then 7, then 9).
+	{
+		Rng rng(0xC6);
+		const int32_t dims = 8, bankCount = 4, candidateCount = 3, k = 3;
+		TestBank bank(rng, bankCount, dims, Quantization::Int8, Metric::Dot);
+		std::vector<std::vector<int8_t>> images;
+		std::vector<XdQuery> queries;
+		BuildRowQueries(bank.view, candidateCount, images, queries);
+
+		const std::vector<Hit> candidates = {Hit{7, 1.0f}, Hit{2, 1.0f}, Hit{9, 1.0f}};
+
+		std::vector<int32_t> sel(static_cast<size_t>(k), -1);
+		std::vector<float> rel(static_cast<size_t>(k), 0.0f);
+		std::vector<float> red(static_cast<size_t>(k), -1.0f);
+		CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
+			bank.view.paddedDims, Metric::Dot, 1.0f, k, sel.data(), rel.data(), red.data()) ==
+			Status::Ok);
+		CHECK_MSG(sel[0] == 1, "tie-break: step 0 selected pos %d, expected pos 1 (index 2)",
+			sel[0]);
+		CHECK_MSG(sel[1] == 0, "tie-break: step 1 selected pos %d, expected pos 0 (index 7)",
+			sel[1]);
+		CHECK_MSG(sel[2] == 2, "tie-break: step 2 selected pos %d, expected pos 2 (index 9)",
+			sel[2]);
+	}
+
+	// --- Status propagation: a Cosine candidate with a hand-built zero self-dot payload
+	// makes ScoreXdPair return ZeroNormQuery on the redundancy pass; SelectDiverseMMR
+	// propagates it rather than swallowing it or substituting a default.
+	{
+		const int32_t paddedDims = 16;
+		std::vector<int8_t> liveImage(static_cast<size_t>(paddedDims), 0);
+		liveImage[0] = 5;
+		std::vector<int8_t> zeroImage(static_cast<size_t>(paddedDims), 0);
+		const XdQuery liveQuery{liveImage.data(), 1.0, 25};
+		const XdQuery zeroQuery{zeroImage.data(), 1.0, 0};
+		const std::vector<XdQuery> queries = {liveQuery, zeroQuery};
+		const std::vector<Hit> candidates = {Hit{0, 2.0f}, Hit{1, 1.0f}};
+
+		std::vector<int32_t> sel(2, -1);
+		std::vector<float> rel(2, 0.0f);
+		std::vector<float> red(2, -1.0f);
+		const Status st = SelectDiverseMMR(candidates.data(), queries.data(), 2, paddedDims,
+			Metric::Cosine, 0.5f, 2, sel.data(), rel.data(), red.data());
+		CHECK_MSG(st == Status::ZeroNormQuery,
+			"zero-norm candidate: SelectDiverseMMR returned status %d, expected ZeroNormQuery",
+			static_cast<int>(st));
+	}
+}
+
+// Coverage audit §7's allocation-cell registry (TestAllocationCellRegistryComplete)
+// requires every public entry point to be classified and, if binding, proven flat.
+// SelectDiverseMMR reuses ScoreXdPair over caller-provided output buffers with no
+// internal collection of its own -- the same allocation-flatness contract this file
+// already proves for every other analytics.h CrossDevice operator it composes.
+static void TestAllocFlatDiversity()
+{
+	Rng rng(0x71EA);
+	const int32_t dims = 16, bankCount = 12, candidateCount = 8, k = 4;
+	TestBank bank(rng, bankCount, dims, Quantization::Int8, Metric::Dot);
+	std::vector<std::vector<int8_t>> images;
+	std::vector<XdQuery> queries;
+	BuildRowQueries(bank.view, candidateCount, images, queries);
+	std::vector<Hit> candidates(static_cast<size_t>(candidateCount));
+	for (int32_t i = 0; i < candidateCount; ++i)
+	{
+		candidates[static_cast<size_t>(i)] = Hit{i, static_cast<float>(candidateCount - i)};
+	}
+	std::vector<int32_t> sel(static_cast<size_t>(k));
+	std::vector<float> rel(static_cast<size_t>(k));
+	std::vector<float> red(static_cast<size_t>(k));
+
+	CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
+		bank.view.paddedDims, Metric::Dot, 0.5f, k, sel.data(), rel.data(), red.data()) ==
+		Status::Ok);
+
+	const uint64_t allocsBefore = AllocationCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
+				bank.view.paddedDims, Metric::Dot, 0.5f, k, sel.data(), rel.data(), red.data()) ==
+				Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"SelectDiverseMMR allocated %llu time(s) outside the seam",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK(AllocationCount() == allocsBefore);
+}
+
 int main()
 {
 	TestSimdEqualsScalar();
@@ -19904,6 +20189,7 @@ int main()
 	TestAllocFlatAnalyticsWholeVector();
 	TestAllocFlatAnalyticsChannel();
 	TestAllocFlatProjectionReport();
+	TestAllocFlatDiversity();
 	TestAllocFlatCompose();
 	TestAllocFlatKernels();
 	TestAllocFlatValidate();
@@ -20029,6 +20315,9 @@ int main()
 	TestScratchLoadValidatesRetainedRegion();
 	TestEmptyCosineChannelBankValidates();
 	TestPeekScratchArchive();
+
+	// V3.4: diversity -- greedy MMR selection (Gate 0b, drift-and-diversity plan §6).
+	TestDiversityMMR();
 
 	// Coverage audit §7 -- the structural registry guard. Runs last so every
 	// cell it references above has already executed at least once.
