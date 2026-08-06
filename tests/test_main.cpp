@@ -20026,6 +20026,30 @@ static double RefSegmentedCosineRaw(const int8_t* a, const int8_t* b,
 	return raw;
 }
 
+// Isolates a single call to ScoreXdPairSegmented so a null-pointer access
+// violation (D-SLM1311, section 6.2's "segmentCount == 0 (or segments ==
+// nullptr)" degenerate case, currently mis-implemented in analytics.cpp as
+// segmentCount == 0 ALONE) is caught as a failing CHECK rather than crashing
+// the whole suite and losing every result after it. Two backends give this
+// the identical portable contract on every job this project's own CI runs
+// (.github/workflows/tests.yml: windows-x64, linux-x64, linux-x64-tsan,
+// macos-arm64) -- SEH on MSVC, POSIX signal + sigsetjmp/siglongjmp
+// elsewhere. A prior revision of this probe existed only under
+// `#if defined(_MSC_VER)`, with the CALL ITSELF also gated behind that same
+// macro -- so on every non-MSVC job the whole cell contributed zero checks,
+// and the CMake path this project's own CI (and, per D-SLM1299/F-3, this
+// entire branch's *only* linkable path) uses carried the regression guard
+// nowhere at all (D-SLM1343): the reviewer reintroduced the fall-through and
+// rebuilt, MSVC caught it, g++ 15.2.0 reported 83274 checks, 0 failures,
+// exit 0 -- a clean green over the access-violation defect. Corrected here:
+// the call and its assertions (below) now run UNCONDITIONALLY on every
+// compiler; only the isolation MECHANISM is platform-conditional, and every
+// platform in the matrix gets a real one, not a "let it crash" fallback --
+// a crash still takes the whole binary down and loses every check that
+// would have run after it, which is a weaker result than a clean, isolated,
+// named CHECK failure. Returns true if the call returned normally (writing
+// *outStatus/*outScore); false if the process would otherwise have crashed
+// before it could return.
 #if defined(_MSC_VER)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -20035,19 +20059,10 @@ static double RefSegmentedCosineRaw(const int8_t* a, const int8_t* b,
 #endif
 #include <Windows.h>
 
-// Isolates a single call to ScoreXdPairSegmented in its own SEH frame so a
-// null-pointer access violation (D-SLM1311, section 6.2's "segmentCount == 0
-// (or segments == nullptr)" degenerate case, currently mis-implemented as
-// segmentCount == 0 ALONE, analytics.cpp) is caught as a failing CHECK rather
-// than crashing the whole suite and losing every result after it. No C++
-// object with a destructor may appear in this function's own scope (MSVC
-// C2712, "cannot use __try in a function that requires object unwinding") --
-// XdQuery is a trivial POD (kernels.h), so passing it by value here is safe.
-// This is a genuine behavioral probe, not a compile-error stand-in: it
-// actually invokes the buggy code path and observes the real access
-// violation the code review reported executing. Returns true if the call
-// returned normally (writing *outStatus/*outScore); false if a structured
-// exception was raised before it could return.
+// No C++ object with a destructor may appear in this function's own scope
+// (MSVC C2712, "cannot use __try in a function that requires object
+// unwinding") -- XdQuery is a trivial POD (kernels.h), so passing it by
+// value here is safe.
 static bool ProbeScoreXdPairSegmentedNoCrash(
 	XdQuery a, XdQuery b, int32_t paddedDims, Metric metric, const QuerySegment* segments,
 	int32_t segmentCount, float* outScore, Status* outStatus)
@@ -20061,6 +20076,67 @@ static bool ProbeScoreXdPairSegmentedNoCrash(
 	{
 		return false;
 	}
+}
+#elif defined(__unix__) || defined(__APPLE__)
+#include <csetjmp>
+#include <csignal>
+
+namespace
+{
+	// File-local, single-use buffer: this probe is called serially from
+	// main(), never concurrently or re-entrantly, so a plain static is
+	// sufficient -- the identical "test-only scaffolding" scope the SEH
+	// branch above has. A null-pointer read raises SIGSEGV on Linux;
+	// some platforms (observed on macOS for certain invalid accesses) raise
+	// SIGBUS for the same underlying fault, so both are handled identically.
+	sigjmp_buf GScoreXdPairSegmentedCrashJmpBuf;
+
+	extern "C" void ScoreXdPairSegmentedCrashHandler(int)
+	{
+		siglongjmp(GScoreXdPairSegmentedCrashJmpBuf, 1);
+	}
+}
+
+static bool ProbeScoreXdPairSegmentedNoCrash(
+	XdQuery a, XdQuery b, int32_t paddedDims, Metric metric, const QuerySegment* segments,
+	int32_t segmentCount, float* outScore, Status* outStatus)
+{
+	struct sigaction newAction{};
+	struct sigaction oldSegvAction{};
+	struct sigaction oldBusAction{};
+	newAction.sa_handler = ScoreXdPairSegmentedCrashHandler;
+	sigemptyset(&newAction.sa_mask);
+	newAction.sa_flags = 0;
+	sigaction(SIGSEGV, &newAction, &oldSegvAction);
+	sigaction(SIGBUS, &newAction, &oldBusAction);
+
+	bool completed = false;
+	if (sigsetjmp(GScoreXdPairSegmentedCrashJmpBuf, 1) == 0)
+	{
+		*outStatus = ScoreXdPairSegmented(a, b, paddedDims, metric, segments, segmentCount, outScore);
+		completed = true;
+	}
+
+	// Restore the prior handlers regardless of outcome, so this probe never
+	// leaves process-global signal state altered for any test that runs
+	// after it.
+	sigaction(SIGSEGV, &oldSegvAction, nullptr);
+	sigaction(SIGBUS, &oldBusAction, nullptr);
+	return completed;
+}
+#else
+// No isolation backend exists for this toolchain (neither MSVC nor POSIX
+// signals) -- documented, not silently assumed. The call still runs
+// unconditionally (below); on a toolchain that reaches this branch, the
+// defect would crash the whole process rather than fail one cell, exactly
+// the disposition the reviewer's own fallback reasoning accepts as a loud
+// failure. No such toolchain exists in this project's own CI matrix today.
+static bool ProbeScoreXdPairSegmentedNoCrash(
+	XdQuery a, XdQuery b, int32_t paddedDims, Metric metric, const QuerySegment* segments,
+	int32_t segmentCount, float* outScore, Status* outStatus)
+{
+	*outStatus = ScoreXdPairSegmented(a, b, paddedDims, metric, segments, segmentCount, outScore);
+	return true;
 }
 #endif
 
@@ -20084,7 +20160,6 @@ static void TestScoreXdPairSegmentedNullSegmentsPositiveCountIsLegal()
 	std::printf(
 		"ScoreXdPairSegmented: segments==nullptr, segmentCount>0 -- legal, degenerate "
 		"(section 6.2, D-SLM1311)\n");
-#if defined(_MSC_VER)
 	Rng rng(0x5EC5EC5E);
 	const int32_t paddedDims = 64;
 	std::vector<int8_t> imgA, imgB;
@@ -20100,9 +20175,9 @@ static void TestScoreXdPairSegmentedNullSegmentsPositiveCountIsLegal()
 	const bool completed = ProbeScoreXdPairSegmentedNoCrash(a, b, paddedDims, Metric::Dot, nullptr,
 		3, &segScore, &segSt);
 	CHECK_MSG(completed,
-		"ScoreXdPairSegmented(segments=nullptr, segmentCount=3) raised an access violation -- "
-		"section 6.2 requires this input to take the degenerate full-row path, bit-identical to "
-		"ScoreXdPair, not dereference a null pointer (D-SLM1311, Critical)");
+		"ScoreXdPairSegmented(segments=nullptr, segmentCount=3) crashed (access violation / "
+		"SIGSEGV/SIGBUS) -- section 6.2 requires this input to take the degenerate full-row path, "
+		"bit-identical to ScoreXdPair, not dereference a null pointer (D-SLM1311, Critical)");
 	if (completed)
 	{
 		CHECK_MSG(segSt == Status::Ok, "null-segments, segmentCount=3: status %d != Ok",
@@ -20111,11 +20186,6 @@ static void TestScoreXdPairSegmentedNullSegmentsPositiveCountIsLegal()
 			"null-segments, segmentCount=3: score %.9g != ScoreXdPair %.9g (not bit-identical)",
 			static_cast<double>(segScore), static_cast<double>(refScore));
 	}
-#else
-	std::printf(
-		"  (skipped: SEH crash isolation is MSVC-only -- on other toolchains this defect "
-		"crashes the whole process rather than failing one cell)\n");
-#endif
 }
 
 // --- dim 8 (section 12 dim 8's own text, D-SLM1315 folding D-SLM1312): the
@@ -20453,10 +20523,22 @@ static void TestScoreXdPairSegmentedLocalValidator()
 // implementation of ValidateSegments' structural rules, not shared code;
 // confirm both reject/accept the SAME malformed/well-formed segment lists on
 // their SHARED rules (grid alignment, ascending/non-overlap, within
-// paddedDims, finite weight) -- excluding the two properties that do not
-// transfer (ValidateSegments' count lower bound of 1, and its separate
-// per-segment zero-sub-norm trigger, both named in section 6.2 as deliberate
-// departures, not defects to agree on).
+// paddedDims, weight finiteness) -- excluding the properties that do not
+// transfer: ValidateSegments' count lower bound of 1 and its separate
+// per-segment zero-sub-norm trigger (both named in section 6.2 as deliberate
+// departures), AND weight SIGN (D-SLM1315, folding D-SLM1312, corrected here
+// -- D-SLM1342): the local validator additionally rejects `seg.weight < 0`,
+// which `ValidateSegments`'s own finiteness-only check (`src/validate.cpp:
+// 148`) does not. Weight sign is a documented THIRD divergence, not a
+// shared rule -- it must never be run through the `agree()` predicate below
+// (which asserts the two validators reach the SAME verdict); it gets its
+// own fixture, asserted as a divergence explicitly. A prior revision of
+// this cell listed weight sign nowhere in its exclusions and never
+// constructed a negative-weight fixture, so it read as proving agreement on
+// a property the two validators had already stopped agreeing on -- true
+// only because no fixture exercised it, which rewards reverting the
+// negative-weight refusal (the fixed cell would have caught that reversion
+// outright, per its own new fixture below).
 static void TestScoreXdPairSegmentedValidatorAgreement()
 {
 	std::printf("ScoreXdPairSegmented vs ValidateSegments: structural-rule agreement (dim 8)\n");
@@ -20493,6 +20575,32 @@ static void TestScoreXdPairSegmentedValidatorAgreement()
 	{ const QuerySegment s[1] = {{0, 16, std::numeric_limits<float>::quiet_NaN()}};
 		agree(s, 1, "non-finite weight"); }
 	{ const QuerySegment s[2] = {{0, 16, 1.0f}, {32, 16, 1.0f}}; agree(s, 2, "well-formed"); }
+
+	// --- The documented THIRD divergence (D-SLM1315, weight sign), asserted
+	// explicitly as a divergence -- NOT run through agree(), which would
+	// wrongly assert the two validators still reach the same verdict here.
+	// ValidateSegments' own finiteness-only check accepts a negative,
+	// finite weight; the local validator refuses it. Both sides of this
+	// assertion are load-bearing: if ValidateSegments ever also starts
+	// rejecting a negative weight, this fixture stops discriminating and the
+	// first CHECK_MSG below fails loudly, naming exactly why.
+	{
+		const QuerySegment s[2] = {{0, 16, -1.0f}, {32, 16, 1.0f}};
+		const Status vs = ValidateSegments(bank, paddedQuery.data(), s, 2);
+		float out = 0.0f;
+		const Status local = ScoreXdPairSegmented(a, b, paddedDims, Metric::Dot, s, 2, &out);
+		CHECK_MSG(vs == Status::Ok,
+			"negative-weight divergence fixture: ValidateSegments must still accept it "
+			"(finiteness-only check, src/validate.cpp:148) -- got status %d; if this changed, "
+			"weight sign is no longer a divergence and this cell's own claim needs re-deriving",
+			static_cast<int>(vs));
+		CHECK_MSG(local == Status::InvalidArgument,
+			"negative-weight divergence fixture: the local validator must refuse it -- got status "
+			"%d (D-SLM1315's own refusal, section 12 dim 8, tested directly by "
+			"TestScoreXdPairSegmentedNegativeWeightRefusal; this cell additionally proves "
+			"ValidateSegments does NOT share it)",
+			static_cast<int>(local));
+	}
 }
 
 // --- dim 2/5 (G-28): Metric::Cosine's ONE trigger is the aggregate weighted
