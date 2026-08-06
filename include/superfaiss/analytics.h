@@ -60,10 +60,11 @@ Status ScoreXdPair(const XdQuery& a, const XdQuery& b, int32_t paddedDims, Metri
 // production caller and layers its own per-metric recovery transform on top of this raw
 // value; this function itself applies no such recovery.
 //
-// `segments`/`segmentCount == 0` (or `segments == nullptr`) scores the single implicit
-// full-row segment `(0, paddedDims, 1.0)` -- bit-identical to
-// `ScoreXdPair(a, b, paddedDims, metric, outScore)`. The count, not the pointer, selects
-// this degenerate path (a non-null `segments` with `segmentCount == 0` still takes it).
+// `segments`/`segmentCount == 0` OR `segments == nullptr` -- TWO INDEPENDENT triggers,
+// either one alone -- scores the single implicit full-row segment `(0, paddedDims, 1.0)`,
+// bit-identical to `ScoreXdPair(a, b, paddedDims, metric, outScore)`. A null `segments` with
+// a positive `segmentCount` is legal input that also takes this path (D-SLM1311): it is
+// never dereferenced.
 //
 // Validates locally, not via `ValidateSegments` (which takes a `BankView`/`paddedQuery`
 // this primitive has neither): the identical `ScoreXdPair` payload law on both `a` and `b`
@@ -71,14 +72,20 @@ Status ScoreXdPair(const XdQuery& a, const XdQuery& b, int32_t paddedDims, Metri
 // no `-128` element, each payload's own `sqSum` matched by a fresh self-dot recompute), plus
 // the structural segment-list rules `ValidateSegments` enforces on a segment list: offsets
 // and lengths positive, on the 16-byte int8-quantization element grid, ascending and
-// non-overlapping, ending within `paddedDims`, weights finite. `InvalidArgument` on any
-// violation. Two deliberate departures from `ValidateSegments`: `segmentCount` is accepted
-// over `[0, kMaxSegments]` (the widened lower bound of `0` is the degenerate path above,
-// versus `ValidateSegments`' `[1, kMaxSegments]`), and `Metric::Cosine` has exactly ONE
-// zero-norm trigger -- either operand's AGGREGATE weighted self-norm over the live ranges
-// being exactly zero (`Status::ZeroNormQuery`) -- not `ValidateSegments`' separate
-// per-segment zero-sub-norm rule; a row zero-content on only one of several weighted
-// channels, with nonzero weighted self-norm overall, is not refused.
+// non-overlapping, ending within `paddedDims`, weights finite AND NON-NEGATIVE (D-SLM1315).
+// `InvalidArgument` on any violation. Three deliberate departures from `ValidateSegments`:
+// `segmentCount` is accepted over `[0, kMaxSegments]` (the widened lower bound of `0` is the
+// degenerate path above, versus `ValidateSegments`' `[1, kMaxSegments]`); `Metric::Cosine`
+// has exactly ONE zero-norm trigger -- either operand's AGGREGATE weighted self-norm over the
+// live ranges being exactly zero (`Status::ZeroNormQuery`) -- not `ValidateSegments`'
+// separate per-segment zero-sub-norm rule, so a row zero-content on only one of several
+// weighted channels, with nonzero weighted self-norm overall, is not refused; and a negative
+// segment weight is refused (`ValidateSegments` checks finiteness only and tolerates one) --
+// stricter, not looser, because a negative weight breaks the per-metric combine below rather
+// than merely going unused: on `Metric::Cosine` it can cancel a weighted self-norm to exactly
+// zero for a payload with nonzero norm (a spurious `ZeroNormQuery`); on `Metric::L2` it can
+// drive the summed distance negative, and `SelectDiverseMMR`'s downstream `sqrt` of a
+// negative value is `NaN` under `Status::Ok`.
 Status ScoreXdPairSegmented(const XdQuery& a, const XdQuery& b, int32_t paddedDims,
 	Metric metric, const QuerySegment* segments, int32_t segmentCount, float* outScore);
 

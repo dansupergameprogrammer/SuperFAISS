@@ -208,10 +208,13 @@ Status ScoreXdPairSegmented(const XdQuery& a, const XdQuery& b, int32_t paddedDi
 		return Status::InvalidArgument;
 	}
 
-	// The degenerate full-row path (this function's doc comment): the count, not the
-	// pointer, selects it. Bit-identical to ScoreXdPair -- reuses the same internal
-	// XdPairScore helper and the same whole-row Cosine zero-norm trigger.
-	if (segmentCount == 0)
+	// The degenerate full-row path (this function's doc comment, section 6.2): TWO
+	// independent triggers -- segmentCount == 0, OR segments == nullptr -- either one alone
+	// selects it (D-SLM1311: a null `segments` with a positive `segmentCount` is legal input
+	// that must also take this path, not fall through to a null-pointer dereference in the
+	// structural-validation loop below). Bit-identical to ScoreXdPair -- reuses the same
+	// internal XdPairScore helper and the same whole-row Cosine zero-norm trigger.
+	if (segmentCount == 0 || segments == nullptr)
 	{
 		if (metric == Metric::Cosine && (a.sqSum == 0 || b.sqSum == 0))
 		{
@@ -222,16 +225,21 @@ Status ScoreXdPairSegmented(const XdQuery& a, const XdQuery& b, int32_t paddedDi
 	}
 
 	// Local structural validation (ValidateSegments' rules, minus the count lower bound of
-	// 1 and the separate per-segment zero-sub-norm trigger -- both named departures, this
-	// function's own doc comment): offsets/lengths positive, on the 16-byte int8-
-	// quantization element grid, ascending and non-overlapping, ending within paddedDims,
-	// weights finite.
+	// 1 and the separate per-segment zero-sub-norm trigger, plus one departure ValidateSegments
+	// does NOT carry -- all three named departures, this function's own doc comment):
+	// offsets/lengths positive, on the 16-byte int8-quantization element grid, ascending and
+	// non-overlapping, ending within paddedDims, weights finite AND non-negative (D-SLM1315,
+	// folding D-SLM1312: a negative weight is not merely unneeded by the per-metric combine
+	// below -- it breaks it, cancelling Cosine's weighted self-norm to a spurious
+	// Status::ZeroNormQuery on a nonzero-norm payload, or driving L2's raw total negative, a
+	// downstream sqrt of which is NaN under Status::Ok. ValidateSegments (src/validate.cpp)
+	// checks finiteness only and tolerates a negative weight; this primitive is stricter).
 	const int32_t grid = kAlignment / ElementSize(Quantization::Int8);
 	int32_t cursor = 0;
 	for (int32_t s = 0; s < segmentCount; ++s)
 	{
 		const QuerySegment& seg = segments[s];
-		if (seg.offset < 0 || seg.length <= 0 || !std::isfinite(seg.weight))
+		if (seg.offset < 0 || seg.length <= 0 || !std::isfinite(seg.weight) || seg.weight < 0.0f)
 		{
 			return Status::InvalidArgument;
 		}
