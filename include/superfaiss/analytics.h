@@ -45,6 +45,43 @@ enum class Reduce : uint8_t
 Status ScoreXdPair(const XdQuery& a, const XdQuery& b, int32_t paddedDims, Metric metric,
 	float* outScore);
 
+// Segmented, weighted cross-device pair score (V3.4 drift-and-diversity plan section 6.2):
+// ScoreXdPair's counterpart to ScoreChunkSegmentedXd (kernels.h), scoring one XdQuery
+// against another over a caller-supplied segment list instead of a bank chunk against one
+// query. Returns the same DISTANCE-sense convention ScoreXdPair documents above (Dot
+// similarity; L2/Cosine distance), weighted per resolved live range: total =
+// sum(weight_s * partial_s), each partial the same fixed-order double epilogue
+// ScoreXdPair's XdDot/XdL2 use (Dot/L2), or the true per-range cosine
+// `1 - cross_s/sqrt(aSq_s*bSq_s)` for Cosine (convention (ii), the D-INSP-57 adopted closed
+// form) -- summed in ascending-offset range order, ending in the same subnormal floor. The
+// resolved-range working array is sized `2*kMaxSegments + 1`, never `kMaxSegments` (the same
+// worst-case bound BuildScanRanges documents: a gap range interleaves before every named
+// segment, plus a trailing one). `SelectDiverseMMR` (diversity.h) is this primitive's sole
+// production caller and layers its own per-metric recovery transform on top of this raw
+// value; this function itself applies no such recovery.
+//
+// `segments`/`segmentCount == 0` (or `segments == nullptr`) scores the single implicit
+// full-row segment `(0, paddedDims, 1.0)` -- bit-identical to
+// `ScoreXdPair(a, b, paddedDims, metric, outScore)`. The count, not the pointer, selects
+// this degenerate path (a non-null `segments` with `segmentCount == 0` still takes it).
+//
+// Validates locally, not via `ValidateSegments` (which takes a `BankView`/`paddedQuery`
+// this primitive has neither): the identical `ScoreXdPair` payload law on both `a` and `b`
+// (non-null `q8`, `paddedDims` in `(0, kMaxCrossDeviceDims]`, finite non-negative `scale`,
+// no `-128` element, each payload's own `sqSum` matched by a fresh self-dot recompute), plus
+// the structural segment-list rules `ValidateSegments` enforces on a segment list: offsets
+// and lengths positive, on the 16-byte int8-quantization element grid, ascending and
+// non-overlapping, ending within `paddedDims`, weights finite. `InvalidArgument` on any
+// violation. Two deliberate departures from `ValidateSegments`: `segmentCount` is accepted
+// over `[0, kMaxSegments]` (the widened lower bound of `0` is the degenerate path above,
+// versus `ValidateSegments`' `[1, kMaxSegments]`), and `Metric::Cosine` has exactly ONE
+// zero-norm trigger -- either operand's AGGREGATE weighted self-norm over the live ranges
+// being exactly zero (`Status::ZeroNormQuery`) -- not `ValidateSegments`' separate
+// per-segment zero-sub-norm rule; a row zero-content on only one of several weighted
+// channels, with nonzero weighted self-norm overall, is not refused.
+Status ScoreXdPairSegmented(const XdQuery& a, const XdQuery& b, int32_t paddedDims,
+	Metric metric, const QuerySegment* segments, int32_t segmentCount, float* outScore);
+
 // Set-to-set centroid distance (plan 22.4): pools each row selection with
 // MakeCentroidCrossDevice and scores the pair with ScoreXdPair. Drift over checkpoints is
 // this operator between consecutive checkpoints' row sets. `weights`/`excludeBits` per
