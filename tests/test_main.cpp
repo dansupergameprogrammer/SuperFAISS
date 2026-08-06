@@ -20838,23 +20838,49 @@ static void TestDiversityMMR()
 					CHECK(red[static_cast<size_t>(i)] == refRed[static_cast<size_t>(i)]);
 				}
 
-				// --- Argmax invariance under a uniform weight rescale (dim 7):
-				// a term added to every candidate's score by the same
-				// per-step constant cannot move the argmax (section 6.2's
-				// cancellation proof) -- selection ORDER at weight vector W
-				// must equal weight vector 2W. l2Scale is unchanged (bank-
-				// intrinsic, not query-channel-weight-dependent).
+				// --- Argmax invariance under a uniform weight rescale (dim 7,
+				// corrected 2026-08-06 -- D-SLM1298 confirmed a real
+				// construction defect here, not a spec/build mismatch; see
+				// the case file for the correction record). Section 6.2's own
+				// derivation ("The structurally sound repair," `x_rel(pos) =
+				// candidates[pos].score` and `x_red(pos, sel)` a WEIGHTED
+				// pairwise distance "using the identical Args.Channels
+				// weights") and its later audit ("relevance's own scaling...
+				// the difference... scales by k uniformly, exactly matching
+				// relevance's own scaling") both state the invariance holds
+				// when relevance and redundancy scale TOGETHER under a
+				// uniform rescale of the one weight vector production feeds
+				// to both the retrieval query (which produces
+				// candidates[pos].score) and SelectDiverseMMR's own
+				// segmented redundancy call -- not when redundancy's segment
+				// weights move while relevance is held fixed. Both raw
+				// operands are linear (degree-1) in the weight vector for
+				// every metric this section specifies (Dot/Cosine directly;
+				// L2's PRE-transform raw squared-distance sum, which is what
+				// `candidates[pos].score` and `ScoreXdPairSegmented`'s raw
+				// output both carry -- `SelectDiverseMMR` applies `f` itself
+				// on top), so doubling the segment weights must be paired
+				// with doubling every candidate's raw `Hit.score` to
+				// reproduce the same underlying rescale this proof is about.
+				// l2Scale is unaffected (bank-intrinsic, not
+				// query-channel-weight-dependent).
 				const QuerySegment segs2x[2] = {{0, half, 3.2f}, {half, half, 0.8f}}; // == 2*segs
+				std::vector<Hit> candidates2x(candidates);
+				for (auto& c : candidates2x)
+				{
+					c.score *= 2.0f; // the same rescale factor k=2 the segment weights carry
+				}
 				std::vector<int32_t> sel2x(static_cast<size_t>(k), -1);
 				std::vector<float> rel2x(static_cast<size_t>(k), 0.0f);
 				std::vector<float> red2x(static_cast<size_t>(k), -1.0f);
-				CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount, pd2,
+				CHECK(SelectDiverseMMR(candidates2x.data(), queries.data(), candidateCount, pd2,
 					metrics[m], 0.4f, k, segs2x, 2, l2Scale, sel2x.data(), rel2x.data(),
 					red2x.data()) == Status::Ok);
 				for (int32_t i = 0; i < k; ++i)
 				{
 					CHECK_MSG(sel[static_cast<size_t>(i)] == sel2x[static_cast<size_t>(i)],
-						"%s argmax invariance: step %d order at W (pos %d) != order at 2W (pos %d)",
+						"%s argmax invariance: step %d order at W (pos %d) != order at 2W with "
+						"relevance rescaled in step (pos %d)",
 						names[m], i, sel[static_cast<size_t>(i)], sel2x[static_cast<size_t>(i)]);
 				}
 			}
