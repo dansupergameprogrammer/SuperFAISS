@@ -19898,18 +19898,18 @@ static void BuildRowQueries(const BankView& bank, int32_t count,
 // test-design case file (Claude/Curie/
 // superfaissunreal-3.4-gate0b-core-test-design-2026-08-06.md).
 //
-// SCOPE NOTE (case-file gap G-CORE-1, decision D-SLM1288): the plan widens
-// SelectDiverseMMR's signature by exactly "const QuerySegment* segments,
-// int32_t segmentCount" (plan section 6.2) and adds no parameter carrying the
-// Metric::L2 bank-intrinsic scale L, although section 6.2's own L2 bullet
-// specifies L2's relevance AND redundancy transforms as functions of L,
-// computed inside SelectDiverseMMR itself ("relevance = 1 - sqrt(candidates
-// [pos].score) / L"). There is no way to call the specified L2 path without
-// guessing where L enters the call, so this suite does not exercise
-// Metric::L2 through SelectDiverseMMR -- routed back to the planner, not
-// invented. ScoreXdPairSegmented's own L2 branch needs no L (it returns the
-// same raw squared-distance sense ScoreXdPair already does) and IS fully
-// covered below.
+// CORRECTION (2026-08-06): an earlier revision of this suite scoped
+// Metric::L2 out of every SelectDiverseMMR-level cell, on the reasoning that
+// the plan's signature carried no parameter for L2's bank-intrinsic scale L
+// (filed as case-file gap G-CORE-1, decision D-SLM1288). That reading was
+// against a stale copy of the plan; the current text specifies a `float
+// l2Scale` parameter (section 6.2's signature block) -- the caller-computed,
+// caller-cached L, read only when `metric == Metric::L2` and ignored
+// otherwise. D-SLM1288 is corrected in place in the decision log rather than
+// deleted; Metric::L2 is fully exercised below, including a dedicated crux
+// cell for section 12 dim 7's "half-applied transform" mutant (an
+// implementation that transforms one of relevance/redundancy and leaves the
+// other raw).
 // ---------------------------------------------------------------------------
 
 // Builds a random paddedDims-length int8 image with values in [-100, 100]
@@ -20532,13 +20532,15 @@ static void TestAllocFlatAnalyticsSegmentedPair()
 // redundancy specification -- an oracle built on the already-trusted
 // ScoreXdPairSegmented primitive (proven standalone above), not a re-test of
 // it, and not sharing the per-metric transform code with src/diversity.cpp.
-// Metric::L2 is intentionally absent -- case-file gap G-CORE-1, D-SLM1288:
-// the plan's own widened signature carries no parameter for the
-// bank-intrinsic scale L2's relevance/redundancy transform requires.
+// `l2Scale` is `L`, read only when `metric == Metric::L2` -- the caller-
+// computed, caller-cached bank-intrinsic scale (section 6.2's `l2Scale`
+// parameter), applied via `f(x) = 1 - sqrt(x)/L` to BOTH the relevance and
+// redundancy operands, matching the real function's own two call sites for
+// that transform.
 static Status RefSelectDiverseMMR(
 	const Hit* candidates, const XdQuery* candidateQueries, int32_t candidateCount,
 	int32_t paddedDims, Metric metric, float lambda, int32_t k,
-	const QuerySegment* segments, int32_t segmentCount,
+	const QuerySegment* segments, int32_t segmentCount, float l2Scale,
 	int32_t* outSelectedIndices, float* outRelevance, float* outRedundancy)
 {
 	const double lim = 1.1754943508222875e-38; // FLT_MIN, exactly -- the subnormal floor.
@@ -20555,6 +20557,17 @@ static Status RefSelectDiverseMMR(
 			{
 				continue;
 			}
+
+			// Relevance: identity for Dot/Cosine; f(x) = 1 - sqrt(x)/L for L2
+			// (section 6.2's L2 bullet, applied to `candidates[pos].score`).
+			float relevance = candidates[pos].score;
+			if (metric == Metric::L2)
+			{
+				relevance = static_cast<float>(1.0 -
+					std::sqrt(static_cast<double>(candidates[pos].score)) /
+						static_cast<double>(l2Scale));
+			}
+
 			double acc = 0.0;
 			for (int32_t s = 0; s < step; ++s)
 			{
@@ -20567,7 +20580,9 @@ static Status RefSelectDiverseMMR(
 					return st;
 				}
 				// The per-metric redundancy transform (section 6.2): Dot is
-				// the identity; Cosine recovers sum(weight_s) - raw.
+				// the identity; Cosine recovers sum(weight_s) - raw; L2 is
+				// the identical f(x) = 1 - sqrt(x)/L applied to the
+				// candidate-to-selected pairwise distance.
 				double transformed = 0.0;
 				if (metric == Metric::Dot)
 				{
@@ -20589,6 +20604,11 @@ static Status RefSelectDiverseMMR(
 					}
 					transformed = sumWeight - static_cast<double>(raw);
 				}
+				else // Metric::L2
+				{
+					transformed = 1.0 -
+						std::sqrt(static_cast<double>(raw)) / static_cast<double>(l2Scale);
+				}
 				acc += transformed;
 			}
 			float redundancy = 0.0f;
@@ -20597,7 +20617,6 @@ static Status RefSelectDiverseMMR(
 				const double mean = acc / static_cast<double>(step);
 				redundancy = (mean < lim && mean > -lim) ? 0.0f : static_cast<float>(mean);
 			}
-			const float relevance = candidates[pos].score;
 			const float score = lambda * relevance - (1.0f - lambda) * redundancy;
 			if (bestPos == -1 || score > bestScore ||
 				(score == bestScore && candidates[pos].index < candidates[bestPos].index))
@@ -20616,22 +20635,47 @@ static Status RefSelectDiverseMMR(
 	return Status::Ok;
 }
 
+// `L = sqrt(Spread(current))` (section 6.2, `l2Scale`'s own specified value):
+// the identical whole-row `SpreadCrossDevice(..., Reduce::Mean)` call drift's
+// own headline denominator uses, computed here directly against a TestBank's
+// full live-row set (a fixture-side stand-in for the plugin's
+// `GetPrimarySource()`, which this core suite has no access to).
+static float ComputeL2ScaleForBank(const TestBank& bank)
+{
+	std::vector<int32_t> rows(static_cast<size_t>(bank.view.count));
+	for (int32_t i = 0; i < bank.view.count; ++i)
+	{
+		rows[static_cast<size_t>(i)] = i;
+	}
+	AlignedBuf centroidScratch(static_cast<size_t>(bank.view.paddedDims));
+	float spread = 0.0f;
+	CHECK(SpreadCrossDevice(bank.view, rows.data(), bank.view.count, nullptr, Reduce::Mean,
+		centroidScratch.I8(), &spread) == Status::Ok);
+	CHECK_MSG(spread > 0.0f, "test fixture bank has zero spread (degenerate) -- L undefined");
+	return static_cast<float>(std::sqrt(static_cast<double>(spread)));
+}
+
 static void TestDiversityMMR()
 {
 	std::printf(
 		"diversity (V3.4, Gate 0b rebuild): greedy MMR selection, corrected redundancy term\n");
-	std::printf(
-		"  (Metric::L2 excluded -- case-file gap G-CORE-1, D-SLM1288: SelectDiverseMMR's\n"
-		"   widened signature carries no parameter for L2's bank-intrinsic scale L)\n");
 
-	const Metric metrics[2] = {Metric::Dot, Metric::Cosine};
-	const char* names[2] = {"dot", "cosine"};
+	const Metric metrics[3] = {Metric::Dot, Metric::Cosine, Metric::L2};
+	const char* names[3] = {"dot", "cosine", "L2"};
 
-	for (int32_t m = 0; m < 2; ++m)
+	for (int32_t m = 0; m < 3; ++m)
 	{
 		Rng rng(0xD1FE5170ull + static_cast<uint64_t>(m));
 		const int32_t dims = 32, bankCount = 24, candidateCount = 10, k = 5;
 		TestBank bank(rng, bankCount, dims, Quantization::Int8, metrics[m]);
+		const bool isL2 = metrics[m] == Metric::L2;
+		// section 6.2: "the caller passes 0.0f for l2Scale on every non-L2
+		// metric -- a placeholder value this function never reads on those
+		// paths." Computed once per bank, reused unchanged across every
+		// sub-cell below, including the channel-weight axis (L is bank-
+		// intrinsic and independent of query channel weighting, per section
+		// 6.2's own "L ... unaffected" statement).
+		const float l2Scale = isL2 ? ComputeL2ScaleForBank(bank) : 0.0f;
 
 		std::vector<std::vector<int8_t>> images;
 		std::vector<XdQuery> queries;
@@ -20640,28 +20684,68 @@ static void TestDiversityMMR()
 		std::vector<Hit> candidates(static_cast<size_t>(candidateCount));
 		for (int32_t i = 0; i < candidateCount; ++i)
 		{
-			// Strictly descending relevance by construction position, so a lambda=1
-			// selection's expected order is known without a separate sort.
-			candidates[static_cast<size_t>(i)] = Hit{
-				i, static_cast<float>(candidateCount - i) + 0.001f * static_cast<float>(i)};
+			if (isL2)
+			{
+				// candidates[pos].score is the RAW, untransformed squared L2
+				// distance (section 6.2: the caller passes it through
+				// unchanged; SelectDiverseMMR applies f itself). f(x) =
+				// 1 - sqrt(x)/L is strictly decreasing, so ascending raw
+				// distance by construction position gives DESCENDING
+				// transformed relevance by position -- the same expected
+				// order the Dot/Cosine branch reaches directly. Scaled by
+				// l2Scale^2 so every candidate's raw distance sits in a
+				// well-behaved range relative to L.
+				candidates[static_cast<size_t>(i)] = Hit{i,
+					(0.05f * l2Scale * l2Scale) * (static_cast<float>(i) + 1.0f)};
+			}
+			else
+			{
+				// Strictly descending relevance by construction position, so
+				// a lambda=1 selection's expected order is known without a
+				// separate sort.
+				candidates[static_cast<size_t>(i)] = Hit{
+					i, static_cast<float>(candidateCount - i) + 0.001f * static_cast<float>(i)};
+			}
 		}
+		auto expectedRelevance = [&](int32_t pos) -> float
+		{
+			if (!isL2)
+			{
+				return candidates[static_cast<size_t>(pos)].score;
+			}
+			return static_cast<float>(1.0 -
+				std::sqrt(static_cast<double>(candidates[static_cast<size_t>(pos)].score)) /
+					static_cast<double>(l2Scale));
+		};
 
 		// --- lambda == 1, channelless (segmentCount == 0): reduces to relevance
 		// order, independent of redundancy, and the first-selection redundancy
-		// convention holds (exactly 0, never a reduction over zero terms).
+		// convention holds (exactly 0, never a reduction over zero terms). For
+		// L2, this is also the direct discriminator for a build that omits f
+		// on the RELEVANCE operand (section 12 dim 7's "half-applied
+		// transform" mutant, relevance half): an implementation using raw
+		// candidates[pos].score directly would rank by ASCENDING raw distance
+		// under lambda=1's plain argmax -- since a larger raw squared
+		// distance is a smaller (or more negative) f(x), maximizing raw
+		// score instead of f(raw score) selects the FARTHEST candidates
+		// first, the reverse of this fixture's expected order.
 		{
 			std::vector<int32_t> sel(static_cast<size_t>(k), -1);
 			std::vector<float> rel(static_cast<size_t>(k), 0.0f);
 			std::vector<float> red(static_cast<size_t>(k), -1.0f);
 			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				bank.view.paddedDims, metrics[m], 1.0f, k, nullptr, 0, sel.data(), rel.data(),
-				red.data()) == Status::Ok);
+				bank.view.paddedDims, metrics[m], 1.0f, k, nullptr, 0, l2Scale, sel.data(),
+				rel.data(), red.data()) == Status::Ok);
 			for (int32_t i = 0; i < k; ++i)
 			{
 				CHECK_MSG(sel[static_cast<size_t>(i)] == i,
-					"%s lambda=1: step %d selected pos %d, expected relevance-order pos %d",
+					"%s lambda=1: step %d selected pos %d, expected relevance-order pos %d "
+					"(for L2: a raw-untransformed-relevance build ranks the OPPOSITE way)",
 					names[m], i, sel[static_cast<size_t>(i)], i);
-				CHECK(rel[static_cast<size_t>(i)] == candidates[static_cast<size_t>(i)].score);
+				CHECK_MSG(rel[static_cast<size_t>(i)] == expectedRelevance(i),
+					"%s lambda=1: step %d relevance %.9g != expected %.9g", names[m], i,
+					static_cast<double>(rel[static_cast<size_t>(i)]),
+					static_cast<double>(expectedRelevance(i)));
 			}
 			CHECK_MSG(red[0] == 0.0f, "%s lambda=1: step 0 redundancy %.9g != 0", names[m],
 				static_cast<double>(red[0]));
@@ -20679,14 +20763,14 @@ static void TestDiversityMMR()
 			std::vector<float> rel(static_cast<size_t>(k), 0.0f);
 			std::vector<float> red(static_cast<size_t>(k), -1.0f);
 			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				bank.view.paddedDims, metrics[m], lambda, k, nullptr, 0, sel.data(), rel.data(),
-				red.data()) == Status::Ok);
+				bank.view.paddedDims, metrics[m], lambda, k, nullptr, 0, l2Scale, sel.data(),
+				rel.data(), red.data()) == Status::Ok);
 
 			std::vector<int32_t> refSel(static_cast<size_t>(k), -1);
 			std::vector<float> refRel(static_cast<size_t>(k), 0.0f);
 			std::vector<float> refRed(static_cast<size_t>(k), -1.0f);
 			CHECK(RefSelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				bank.view.paddedDims, metrics[m], lambda, k, nullptr, 0, refSel.data(),
+				bank.view.paddedDims, metrics[m], lambda, k, nullptr, 0, l2Scale, refSel.data(),
 				refRel.data(), refRed.data()) == Status::Ok);
 
 			for (int32_t i = 0; i < k; ++i)
@@ -20709,11 +20793,11 @@ static void TestDiversityMMR()
 			std::vector<float> relA(static_cast<size_t>(k)), relB(static_cast<size_t>(k));
 			std::vector<float> redA(static_cast<size_t>(k)), redB(static_cast<size_t>(k));
 			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				bank.view.paddedDims, metrics[m], 0.5f, k, nullptr, 0, selA.data(), relA.data(),
-				redA.data()) == Status::Ok);
+				bank.view.paddedDims, metrics[m], 0.5f, k, nullptr, 0, l2Scale, selA.data(),
+				relA.data(), redA.data()) == Status::Ok);
 			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				bank.view.paddedDims, metrics[m], 0.5f, k, nullptr, 0, selB.data(), relB.data(),
-				redB.data()) == Status::Ok);
+				bank.view.paddedDims, metrics[m], 0.5f, k, nullptr, 0, l2Scale, selB.data(),
+				relB.data(), redB.data()) == Status::Ok);
 			CHECK(selA == selB);
 			CHECK(relA == relB);
 			CHECK(redA == redB);
@@ -20722,9 +20806,11 @@ static void TestDiversityMMR()
 		// --- Channel-weight axis (dim 4, D-INSP-55/57/58): non-default
 		// weights, sum(weight_s) != 1 -- cross-checked against
 		// RefSelectDiverseMMR's own weighted transform (Cosine's
-		// sum(weight_s) - x recovery; Dot's identity), not the pre-fold fixed-
-		// 1 recovery. A build using the fixed constant instead of
-		// sum(weight_s) fails this cell (mutation-provable, section 12 dim 7).
+		// sum(weight_s) - x recovery; Dot's identity; L2's f(x) applied to
+		// the weighted ScoreXdPairSegmented output), not the pre-fold fixed-
+		// 1 Cosine recovery. A build using the fixed constant instead of
+		// sum(weight_s) fails this cell for Cosine (mutation-provable,
+		// section 12 dim 7).
 		{
 			const int32_t pd2 = bank.view.paddedDims;
 			const int32_t half = (pd2 / 32) * 16; // first half, rounded to the 16-elem grid
@@ -20733,14 +20819,14 @@ static void TestDiversityMMR()
 			std::vector<float> rel(static_cast<size_t>(k), 0.0f);
 			std::vector<float> red(static_cast<size_t>(k), -1.0f);
 			const Status st = SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				pd2, metrics[m], 0.4f, k, segs, 2, sel.data(), rel.data(), red.data());
+				pd2, metrics[m], 0.4f, k, segs, 2, l2Scale, sel.data(), rel.data(), red.data());
 
 			std::vector<int32_t> refSel(static_cast<size_t>(k), -1);
 			std::vector<float> refRel(static_cast<size_t>(k), 0.0f);
 			std::vector<float> refRed(static_cast<size_t>(k), -1.0f);
 			const Status refSt = RefSelectDiverseMMR(candidates.data(), queries.data(),
-				candidateCount, pd2, metrics[m], 0.4f, k, segs, 2, refSel.data(), refRel.data(),
-				refRed.data());
+				candidateCount, pd2, metrics[m], 0.4f, k, segs, 2, l2Scale, refSel.data(),
+				refRel.data(), refRed.data());
 			CHECK(st == refSt);
 			if (st == Status::Ok && refSt == Status::Ok)
 			{
@@ -20756,14 +20842,15 @@ static void TestDiversityMMR()
 				// a term added to every candidate's score by the same
 				// per-step constant cannot move the argmax (section 6.2's
 				// cancellation proof) -- selection ORDER at weight vector W
-				// must equal weight vector 2W.
+				// must equal weight vector 2W. l2Scale is unchanged (bank-
+				// intrinsic, not query-channel-weight-dependent).
 				const QuerySegment segs2x[2] = {{0, half, 3.2f}, {half, half, 0.8f}}; // == 2*segs
 				std::vector<int32_t> sel2x(static_cast<size_t>(k), -1);
 				std::vector<float> rel2x(static_cast<size_t>(k), 0.0f);
 				std::vector<float> red2x(static_cast<size_t>(k), -1.0f);
 				CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount, pd2,
-					metrics[m], 0.4f, k, segs2x, 2, sel2x.data(), rel2x.data(), red2x.data()) ==
-					Status::Ok);
+					metrics[m], 0.4f, k, segs2x, 2, l2Scale, sel2x.data(), rel2x.data(),
+					red2x.data()) == Status::Ok);
 				for (int32_t i = 0; i < k; ++i)
 				{
 					CHECK_MSG(sel[static_cast<size_t>(i)] == sel2x[static_cast<size_t>(i)],
@@ -20792,7 +20879,7 @@ static void TestDiversityMMR()
 		std::vector<float> rel(static_cast<size_t>(k), 0.0f);
 		std::vector<float> red(static_cast<size_t>(k), -1.0f);
 		CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-			bank.view.paddedDims, Metric::Dot, 1.0f, k, nullptr, 0, sel.data(), rel.data(),
+			bank.view.paddedDims, Metric::Dot, 1.0f, k, nullptr, 0, 0.0f, sel.data(), rel.data(),
 			red.data()) == Status::Ok);
 		CHECK_MSG(sel[0] == 1, "tie-break: step 0 selected pos %d, expected pos 1 (index 2)",
 			sel[0]);
@@ -20820,7 +20907,7 @@ static void TestDiversityMMR()
 		std::vector<float> rel(2, 0.0f);
 		std::vector<float> red(2, -1.0f);
 		const Status st = SelectDiverseMMR(candidates.data(), queries.data(), 2, paddedDims,
-			Metric::Cosine, 0.5f, 2, nullptr, 0, sel.data(), rel.data(), red.data());
+			Metric::Cosine, 0.5f, 2, nullptr, 0, 0.0f, sel.data(), rel.data(), red.data());
 		CHECK_MSG(st == Status::ZeroNormQuery,
 			"zero-norm candidate: SelectDiverseMMR returned status %d, expected ZeroNormQuery",
 			static_cast<int>(st));
@@ -20846,7 +20933,7 @@ static void TestDiversityMMR()
 		std::vector<float> rel(2, 0.0f);
 		std::vector<float> red(2, -1.0f);
 		const Status st = SelectDiverseMMR(candidates.data(), queries.data(), 2, paddedDims,
-			Metric::Cosine, 0.5f, 2, segs, 2, sel.data(), rel.data(), red.data());
+			Metric::Cosine, 0.5f, 2, segs, 2, 0.0f, sel.data(), rel.data(), red.data());
 		CHECK_MSG(st == Status::ZeroNormQuery,
 			"weighted zero-norm candidate: SelectDiverseMMR returned status %d, expected "
 			"ZeroNormQuery", static_cast<int>(st));
@@ -20885,13 +20972,72 @@ static void TestDiversityMMR()
 		std::vector<float> rel(2, 0.0f);
 		std::vector<float> red(2, -1.0f);
 		CHECK(SelectDiverseMMR(pooledCandidates.data(), pool.data(), 3, paddedDims, Metric::Cosine,
-			0.5f, 2, nullptr, 0, sel.data(), rel.data(), red.data()) == Status::Ok);
+			0.5f, 2, nullptr, 0, 0.0f, sel.data(), rel.data(), red.data()) == Status::Ok);
 		CHECK_MSG(sel[0] == 0,
 			"crux fixture: step 0 must pick the highest-relevance seed, got pos %d", sel[0]);
 		CHECK(red[0] == 0.0f);
 		CHECK_MSG(sel[1] == 2,
 			"crux fixture: step 1 must pick the DIVERSE candidate (pos 2), not the near-duplicate "
 			"(pos 1) -- got pos %d (this is the D-INSP-47 polarity-inversion cell)", sel[1]);
+	}
+
+	// --- The L2 crux (section 12 dim 7's third mutant, section 6.2): a build
+	// that applies f(x) = 1 - sqrt(x)/L to relevance but leaves REDUNDANCY
+	// raw (the untransformed squared distance) is a distinct, independently
+	// plausible coding error from either operand's own correctness -- the
+	// lambda=1 cell above catches the relevance-side omission; this cell
+	// catches the redundancy-side one. Equal raw relevance on both
+	// candidates (transformed identically) isolates redundancy as the sole
+	// decider, mirroring the Cosine crux's shape: with f correctly applied,
+	// the near-duplicate's small raw distance transforms to a HIGH
+	// redundancy (penalized); the diverse candidate's large raw distance
+	// transforms to a LOW/negative redundancy (preferred). A build using the
+	// raw distance directly inverts this -- small raw distance subtracts
+	// least, so it prefers the duplicate.
+	{
+		const int32_t paddedDims = 16;
+		const float l2Scale = 10.0f; // arbitrary, self-consistent (no bank dependency)
+		std::vector<int8_t> selectedImg(static_cast<size_t>(paddedDims), 4);
+		std::vector<int8_t> dupImg(static_cast<size_t>(paddedDims), 4);
+		dupImg[0] = 5; // one lane off by 1: raw squared distance to selected = 1
+		std::vector<int8_t> diverseImg(static_cast<size_t>(paddedDims));
+		for (int32_t i = 0; i < paddedDims; ++i)
+		{
+			diverseImg[static_cast<size_t>(i)] = (i % 2 == 0) ? int8_t(4) : int8_t(-4);
+		}
+		// Raw squared distance to selected: 8 odd lanes each (4 - (-4))^2 = 64 -> 512.
+		const XdQuery selectedQ{selectedImg.data(), 1.0,
+			detail::DotI8I8(selectedImg.data(), selectedImg.data(), paddedDims)};
+		const XdQuery dupQ{dupImg.data(), 1.0,
+			detail::DotI8I8(dupImg.data(), dupImg.data(), paddedDims)};
+		const XdQuery divQ{diverseImg.data(), 1.0,
+			detail::DotI8I8(diverseImg.data(), diverseImg.data(), paddedDims)};
+		std::vector<XdQuery> pool = {selectedQ, dupQ, divQ};
+
+		// candidates[].score is the RAW squared distance from the query (not
+		// the candidate-to-selected distance above): 0 for the seed (highest
+		// transformed relevance), and an EQUAL raw value for dup/diverse so
+		// their transformed relevance ties exactly -- only redundancy can
+		// break the step-1 choice.
+		const std::vector<Hit> pooledCandidates = {
+			Hit{2, 0.0f}, // pos 0: seed, raw distance 0 -> relevance 1.0, picked first
+			Hit{0, 4.0f}, // pos 1: near-duplicate of pos 0, raw query-distance 4
+			Hit{1, 4.0f}, // pos 2: diverse from pos 0, equal raw query-distance to pos 1
+		};
+		std::vector<int32_t> sel(2, -1);
+		std::vector<float> rel(2, 0.0f);
+		std::vector<float> red(2, -1.0f);
+		CHECK(SelectDiverseMMR(pooledCandidates.data(), pool.data(), 3, paddedDims, Metric::L2,
+			0.5f, 2, nullptr, 0, l2Scale, sel.data(), rel.data(), red.data()) == Status::Ok);
+		CHECK_MSG(sel[0] == 0,
+			"L2 crux fixture: step 0 must pick the highest-relevance seed, got pos %d", sel[0]);
+		CHECK(red[0] == 0.0f);
+		CHECK_MSG(sel[1] == 2,
+			"L2 crux fixture: step 1 must pick the DIVERSE candidate (pos 2, large raw distance "
+			"to the selected member -> low/negative transformed redundancy), not the "
+			"near-duplicate (pos 1, small raw distance -> high transformed redundancy) -- got "
+			"pos %d (this is section 12 dim 7's redundancy-side half-applied-transform mutant)",
+			sel[1]);
 	}
 }
 
@@ -20919,8 +21065,8 @@ static void TestAllocFlatDiversity()
 	const QuerySegment segs[1] = {{0, bank.view.paddedDims, 1.0f}};
 
 	CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-		bank.view.paddedDims, Metric::Dot, 0.5f, k, segs, 1, sel.data(), rel.data(), red.data()) ==
-		Status::Ok);
+		bank.view.paddedDims, Metric::Dot, 0.5f, k, segs, 1, 0.0f, sel.data(), rel.data(),
+		red.data()) == Status::Ok);
 
 	const uint64_t allocsBefore = AllocationCount();
 	{
@@ -20928,7 +21074,7 @@ static void TestAllocFlatDiversity()
 		for (int32_t i = 0; i < 10; ++i)
 		{
 			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				bank.view.paddedDims, Metric::Dot, 0.5f, k, segs, 1, sel.data(), rel.data(),
+				bank.view.paddedDims, Metric::Dot, 0.5f, k, segs, 1, 0.0f, sel.data(), rel.data(),
 				red.data()) == Status::Ok);
 		}
 		CHECK_MSG(rawTracking.Count() == 0,
