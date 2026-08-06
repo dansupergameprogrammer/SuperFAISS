@@ -32,6 +32,26 @@
 #include <vector>
 #include <algorithm>
 
+// Crash-isolation backend for the null-`segments` regression probe
+// (ProbeScoreXdPairSegmentedNoCrash / TestScoreXdPairSegmentedNullSegments
+// PositiveCountIsLegal, D-SLM1311/D-SLM1343): system includes belong at file
+// scope like every other header this file pulls in, not buried mid-file
+// (D-SLM1351, surviving from the prior review's R-3 through the portability
+// rework that widened it from one mid-file include to three) -- SEH on
+// MSVC, POSIX signal handling elsewhere.
+#if defined(_MSC_VER)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#elif defined(__unix__) || defined(__APPLE__)
+#include <csetjmp>
+#include <csignal>
+#endif
+
 using namespace superfaiss;
 
 static int GChecks = 0;
@@ -20028,37 +20048,32 @@ static double RefSegmentedCosineRaw(const int8_t* a, const int8_t* b,
 
 // Isolates a single call to ScoreXdPairSegmented so a null-pointer access
 // violation (D-SLM1311, section 6.2's "segmentCount == 0 (or segments ==
-// nullptr)" degenerate case, currently mis-implemented in analytics.cpp as
-// segmentCount == 0 ALONE) is caught as a failing CHECK rather than crashing
-// the whole suite and losing every result after it. Two backends give this
-// the identical portable contract on every job this project's own CI runs
-// (.github/workflows/tests.yml: windows-x64, linux-x64, linux-x64-tsan,
-// macos-arm64) -- SEH on MSVC, POSIX signal + sigsetjmp/siglongjmp
-// elsewhere. A prior revision of this probe existed only under
+// nullptr)" degenerate case) is caught as a failing CHECK rather than
+// crashing the whole suite and losing every result after it. D-SLM1311 and
+// D-SLM1343 are both fixed and mutation-proven at this file's current
+// revision (analytics.cpp:217, :242) -- this comment block, and the fixture
+// below, describe the regression this probe guards against, not a live
+// defect. Two backends give the guard the identical portable contract on
+// every job this project's own CI runs (.github/workflows/tests.yml:
+// windows-x64, linux-x64, linux-x64-tsan, macos-arm64) -- SEH on MSVC,
+// POSIX signal + sigsetjmp/siglongjmp elsewhere (system includes live at
+// file scope, D-SLM1351). A prior revision of this probe existed only under
 // `#if defined(_MSC_VER)`, with the CALL ITSELF also gated behind that same
 // macro -- so on every non-MSVC job the whole cell contributed zero checks,
 // and the CMake path this project's own CI (and, per D-SLM1299/F-3, this
 // entire branch's *only* linkable path) uses carried the regression guard
-// nowhere at all (D-SLM1343): the reviewer reintroduced the fall-through and
-// rebuilt, MSVC caught it, g++ 15.2.0 reported 83274 checks, 0 failures,
-// exit 0 -- a clean green over the access-violation defect. Corrected here:
-// the call and its assertions (below) now run UNCONDITIONALLY on every
-// compiler; only the isolation MECHANISM is platform-conditional, and every
-// platform in the matrix gets a real one, not a "let it crash" fallback --
-// a crash still takes the whole binary down and loses every check that
-// would have run after it, which is a weaker result than a clean, isolated,
-// named CHECK failure. Returns true if the call returned normally (writing
-// *outStatus/*outScore); false if the process would otherwise have crashed
-// before it could return.
+// nowhere at all (D-SLM1343, since fixed): the reviewer reintroduced the
+// fall-through and rebuilt, MSVC caught it, g++ 15.2.0 reported 83274
+// checks, 0 failures, exit 0 -- a clean green over the access-violation
+// defect. Corrected: the call and its assertions (below) now run
+// UNCONDITIONALLY on every compiler; only the isolation MECHANISM is
+// platform-conditional, and every platform in the matrix gets a real one,
+// not a "let it crash" fallback -- a crash still takes the whole binary
+// down and loses every check that would have run after it, which is a
+// weaker result than a clean, isolated, named CHECK failure. Returns true
+// if the call returned normally (writing *outStatus/*outScore); false if
+// the process would otherwise have crashed before it could return.
 #if defined(_MSC_VER)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <Windows.h>
-
 // No C++ object with a destructor may appear in this function's own scope
 // (MSVC C2712, "cannot use __try in a function that requires object
 // unwinding") -- XdQuery is a trivial POD (kernels.h), so passing it by
@@ -20078,9 +20093,6 @@ static bool ProbeScoreXdPairSegmentedNoCrash(
 	}
 }
 #elif defined(__unix__) || defined(__APPLE__)
-#include <csetjmp>
-#include <csignal>
-
 namespace
 {
 	// File-local, single-use buffer: this probe is called serially from
@@ -20140,21 +20152,24 @@ static bool ProbeScoreXdPairSegmentedNoCrash(
 }
 #endif
 
-// --- dim 2 (D-SLM1311, Poirot F-1, Critical): section 6.2 states the
+// --- dim 2 (D-SLM1311, Poirot F-1, Critical, fixed and mutation-proven --
+// see this cell's own crash-isolation probe above): section 6.2 states the
 // degenerate full-row path is selected by "segmentCount == 0 (or segments ==
 // nullptr)" -- an OR of two independent conditions, so a null `segments`
 // with a POSITIVE `segmentCount` is explicitly legal input that must ALSO
 // take the degenerate path, bit-identical to ScoreXdPair, never dereference
-// `segments`. `src/analytics.cpp`'s current guard is `segmentCount == 0`
-// alone; a null pointer with segmentCount > 0 falls through to the
-// segment-list validation loop and reads `segments[s]`, an access violation.
-// (`src/diversity.cpp`'s own `cosineWeightSum` computation guards
+// `segments`. `src/analytics.cpp`'s guard is now `segmentCount == 0 ||
+// segments == nullptr` (`analytics.cpp:217`); pre-fix it was `segmentCount
+// == 0` alone, and a null pointer with segmentCount > 0 fell through to the
+// segment-list validation loop and read `segments[s]`, an access violation
+// -- this cell's own regression guard, still exercised below.
+// (`src/diversity.cpp`'s own `cosineWeightSum` computation guarded
 // `segmentCount > 0 && segments != nullptr` correctly before forwarding the
-// SAME unguarded pair into `ScoreXdPairSegmented` two lines later -- the two
-// files of one commit disagree, and a cell reaching only
-// `SelectDiverseMMR`'s guarded read would prove nothing about the
-// unconditional forward that follows it. Tested directly against the public
-// primitive here, not through `SelectDiverseMMR`.)
+// SAME pair into `ScoreXdPairSegmented` two lines later even pre-fix -- the
+// two files of one commit disagreed, and a cell reaching only
+// `SelectDiverseMMR`'s guarded read would have proven nothing about the
+// unconditional forward that followed it. Tested directly against the
+// public primitive here, not through `SelectDiverseMMR`.)
 static void TestScoreXdPairSegmentedNullSegmentsPositiveCountIsLegal()
 {
 	std::printf(
@@ -20188,20 +20203,24 @@ static void TestScoreXdPairSegmentedNullSegmentsPositiveCountIsLegal()
 	}
 }
 
-// --- dim 8 (section 12 dim 8's own text, D-SLM1315 folding D-SLM1312): the
-// local validator's weight law is "finite and non-negative" (widened from
-// "finite" alone) -- a second deliberate departure from ValidateSegments,
-// stricter rather than looser. Construct a segment list carrying one
-// negative, finite weight and confirm InvalidArgument on both Metric::Cosine
-// and Metric::L2 -- the required assertion section 12 dim 8's own text
-// states. A generic random fixture is enough to prove the refusal is
-// currently missing (both metrics return Status::Ok with a defined value,
-// not InvalidArgument); two further, precisely constructed fixtures below
-// additionally reproduce -- not merely cite -- the specific pre-fix
-// dispositions the plan's own background names (Cosine's exact-zero
-// weighted-self-norm cancellation; L2's negative raw total, the direct
-// precursor to the NaN a downstream sqrt would produce), so the failure mode
-// reported for this cell is executed, not asserted from the plan's prose.
+// --- dim 8 (section 12 dim 8's own text, D-SLM1315 folding D-SLM1312, fixed
+// and mutation-proven -- analytics.cpp:242): the local validator's weight
+// law is "finite and non-negative" (widened from "finite" alone) -- the
+// THIRD deliberate departure from ValidateSegments (matching
+// `analytics.h`'s own three-item enumeration and this file's own
+// TestScoreXdPairSegmentedValidatorAgreement, below), stricter rather than
+// looser. Construct a segment list carrying one negative, finite weight and
+// confirm InvalidArgument on both Metric::Cosine and Metric::L2 -- the
+// required assertion section 12 dim 8's own text states. A generic random
+// fixture is enough to prove the refusal fires (both metrics return
+// InvalidArgument, not the pre-fix Status::Ok with a defined value); two
+// further, precisely constructed fixtures below additionally reproduce --
+// not merely cite -- the specific pre-fix dispositions the plan's own
+// background names (Cosine's exact-zero weighted-self-norm cancellation;
+// L2's negative raw total, the direct precursor to the NaN a downstream
+// sqrt would produce), executed against both the fixed implementation
+// (confirming the refusal) and, historically, against the pre-fix one
+// (confirming the cell discriminates) -- not asserted from the plan's prose.
 static void TestScoreXdPairSegmentedNegativeWeightRefusal()
 {
 	std::printf(
