@@ -20026,6 +20026,212 @@ static double RefSegmentedCosineRaw(const int8_t* a, const int8_t* b,
 	return raw;
 }
 
+#if defined(_MSC_VER)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+
+// Isolates a single call to ScoreXdPairSegmented in its own SEH frame so a
+// null-pointer access violation (D-SLM1311, section 6.2's "segmentCount == 0
+// (or segments == nullptr)" degenerate case, currently mis-implemented as
+// segmentCount == 0 ALONE, analytics.cpp) is caught as a failing CHECK rather
+// than crashing the whole suite and losing every result after it. No C++
+// object with a destructor may appear in this function's own scope (MSVC
+// C2712, "cannot use __try in a function that requires object unwinding") --
+// XdQuery is a trivial POD (kernels.h), so passing it by value here is safe.
+// This is a genuine behavioral probe, not a compile-error stand-in: it
+// actually invokes the buggy code path and observes the real access
+// violation the code review reported executing. Returns true if the call
+// returned normally (writing *outStatus/*outScore); false if a structured
+// exception was raised before it could return.
+static bool ProbeScoreXdPairSegmentedNoCrash(
+	XdQuery a, XdQuery b, int32_t paddedDims, Metric metric, const QuerySegment* segments,
+	int32_t segmentCount, float* outScore, Status* outStatus)
+{
+	__try
+	{
+		*outStatus = ScoreXdPairSegmented(a, b, paddedDims, metric, segments, segmentCount, outScore);
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
+}
+#endif
+
+// --- dim 2 (D-SLM1311, Poirot F-1, Critical): section 6.2 states the
+// degenerate full-row path is selected by "segmentCount == 0 (or segments ==
+// nullptr)" -- an OR of two independent conditions, so a null `segments`
+// with a POSITIVE `segmentCount` is explicitly legal input that must ALSO
+// take the degenerate path, bit-identical to ScoreXdPair, never dereference
+// `segments`. `src/analytics.cpp`'s current guard is `segmentCount == 0`
+// alone; a null pointer with segmentCount > 0 falls through to the
+// segment-list validation loop and reads `segments[s]`, an access violation.
+// (`src/diversity.cpp`'s own `cosineWeightSum` computation guards
+// `segmentCount > 0 && segments != nullptr` correctly before forwarding the
+// SAME unguarded pair into `ScoreXdPairSegmented` two lines later -- the two
+// files of one commit disagree, and a cell reaching only
+// `SelectDiverseMMR`'s guarded read would prove nothing about the
+// unconditional forward that follows it. Tested directly against the public
+// primitive here, not through `SelectDiverseMMR`.)
+static void TestScoreXdPairSegmentedNullSegmentsPositiveCountIsLegal()
+{
+	std::printf(
+		"ScoreXdPairSegmented: segments==nullptr, segmentCount>0 -- legal, degenerate "
+		"(section 6.2, D-SLM1311)\n");
+#if defined(_MSC_VER)
+	Rng rng(0x5EC5EC5E);
+	const int32_t paddedDims = 64;
+	std::vector<int8_t> imgA, imgB;
+	XdQuery a{}, b{};
+	MakeRandomXdImage(rng, paddedDims, 0.03125, imgA, a);
+	MakeRandomXdImage(rng, paddedDims, 0.0625, imgB, b);
+
+	float refScore = 0.0f;
+	CHECK(ScoreXdPair(a, b, paddedDims, Metric::Dot, &refScore) == Status::Ok);
+
+	float segScore = -12345.0f;
+	Status segSt = Status::Ok;
+	const bool completed = ProbeScoreXdPairSegmentedNoCrash(a, b, paddedDims, Metric::Dot, nullptr,
+		3, &segScore, &segSt);
+	CHECK_MSG(completed,
+		"ScoreXdPairSegmented(segments=nullptr, segmentCount=3) raised an access violation -- "
+		"section 6.2 requires this input to take the degenerate full-row path, bit-identical to "
+		"ScoreXdPair, not dereference a null pointer (D-SLM1311, Critical)");
+	if (completed)
+	{
+		CHECK_MSG(segSt == Status::Ok, "null-segments, segmentCount=3: status %d != Ok",
+			static_cast<int>(segSt));
+		CHECK_MSG(segScore == refScore,
+			"null-segments, segmentCount=3: score %.9g != ScoreXdPair %.9g (not bit-identical)",
+			static_cast<double>(segScore), static_cast<double>(refScore));
+	}
+#else
+	std::printf(
+		"  (skipped: SEH crash isolation is MSVC-only -- on other toolchains this defect "
+		"crashes the whole process rather than failing one cell)\n");
+#endif
+}
+
+// --- dim 8 (section 12 dim 8's own text, D-SLM1315 folding D-SLM1312): the
+// local validator's weight law is "finite and non-negative" (widened from
+// "finite" alone) -- a second deliberate departure from ValidateSegments,
+// stricter rather than looser. Construct a segment list carrying one
+// negative, finite weight and confirm InvalidArgument on both Metric::Cosine
+// and Metric::L2 -- the required assertion section 12 dim 8's own text
+// states. A generic random fixture is enough to prove the refusal is
+// currently missing (both metrics return Status::Ok with a defined value,
+// not InvalidArgument); two further, precisely constructed fixtures below
+// additionally reproduce -- not merely cite -- the specific pre-fix
+// dispositions the plan's own background names (Cosine's exact-zero
+// weighted-self-norm cancellation; L2's negative raw total, the direct
+// precursor to the NaN a downstream sqrt would produce), so the failure mode
+// reported for this cell is executed, not asserted from the plan's prose.
+static void TestScoreXdPairSegmentedNegativeWeightRefusal()
+{
+	std::printf(
+		"ScoreXdPairSegmented: negative segment weight refused, Cosine/L2 (section 12 dim 8, "
+		"D-SLM1315)\n");
+
+	// --- The required assertion: a generic fixture, one negative finite
+	// weight, otherwise well-formed (grid-aligned, ascending, non-
+	// overlapping, ending within paddedDims) -- isolates the weight's sign
+	// as the only violation.
+	{
+		const int32_t paddedDims = 32;
+		Rng rng(0x4E6A71);
+		std::vector<int8_t> imgA, imgB;
+		XdQuery a{}, b{};
+		MakeRandomXdImage(rng, paddedDims, 1.0, imgA, a);
+		MakeRandomXdImage(rng, paddedDims, 1.0, imgB, b);
+		const QuerySegment segs[2] = {{0, 16, -0.5f}, {16, 16, 1.0f}};
+
+		const Metric metrics[2] = {Metric::Cosine, Metric::L2}; // dim 8's own named pair
+		const char* names[2] = {"cosine", "L2"};
+		for (int32_t m = 0; m < 2; ++m)
+		{
+			float out = 12345.0f;
+			const Status st = ScoreXdPairSegmented(a, b, paddedDims, metrics[m], segs, 2, &out);
+			CHECK_MSG(st == Status::InvalidArgument,
+				"%s: negative segment weight must be InvalidArgument, got status %d (a defined "
+				"value, %.9g, not a refusal) (section 12 dim 8, D-SLM1315)",
+				names[m], static_cast<int>(st), static_cast<double>(out));
+		}
+	}
+
+	// --- Cosine's specific pre-fix disposition, reproduced exactly: two
+	// equal-length ranges with IDENTICAL content in `a` (so aSq_0 == aSq_1)
+	// and opposite-sign, equal-magnitude weights -- weightedASq =
+	// -1*aSq_0 + 1*aSq_1 = 0 exactly (double subtraction of equal values),
+	// cancelling operand `a`'s weighted self-norm to exactly zero on a
+	// payload whose own whole-row sqSum is nonzero (not a genuinely
+	// zero-content row). Pre-fix, this must return the spurious
+	// Status::ZeroNormQuery the plan's background names.
+	{
+		const int32_t paddedDims = 32;
+		std::vector<int8_t> imgA(static_cast<size_t>(paddedDims));
+		for (int32_t i = 0; i < 16; ++i)
+		{
+			const int8_t v = static_cast<int8_t>(3 + (i % 5));
+			imgA[static_cast<size_t>(i)] = v;
+			imgA[static_cast<size_t>(i + 16)] = v; // identical content, second range
+		}
+		std::vector<int8_t> imgB(static_cast<size_t>(paddedDims));
+		for (int32_t i = 0; i < paddedDims; ++i)
+		{
+			imgB[static_cast<size_t>(i)] = static_cast<int8_t>(1 + (i % 7));
+		}
+		const XdQuery a{imgA.data(), 1.0, detail::DotI8I8(imgA.data(), imgA.data(), paddedDims)};
+		const XdQuery b{imgB.data(), 1.0, detail::DotI8I8(imgB.data(), imgB.data(), paddedDims)};
+		const QuerySegment segs[2] = {{0, 16, -1.0f}, {16, 16, 1.0f}}; // cancels a's weighted self-norm
+
+		float out = 12345.0f;
+		const Status st = ScoreXdPairSegmented(a, b, paddedDims, Metric::Cosine, segs, 2, &out);
+		CHECK_MSG(st == Status::InvalidArgument,
+			"cosine, exact-cancellation fixture: negative weight must be InvalidArgument, got "
+			"status %d (executed pre-fix disposition: %s) (section 12 dim 8, D-SLM1315)",
+			static_cast<int>(st),
+			st == Status::ZeroNormQuery
+				? "the predicted spurious Status::ZeroNormQuery on a nonzero-norm payload"
+				: "not the predicted ZeroNormQuery -- see value/status above");
+	}
+
+	// --- L2's specific pre-fix disposition, reproduced exactly: a single
+	// segment spanning the whole row at a negative weight makes the total
+	// exactly `-1 * partial`, `partial` a genuine (non-negative) squared
+	// distance -- a negative raw ScoreXdPairSegmented output, the direct
+	// precursor to `sqrt(negative) = NaN` a downstream L2 relevance/
+	// redundancy transform (SelectDiverseMMR, section 6.2) would produce
+	// under Status::Ok. This cell tests ScoreXdPairSegmented alone (per dim
+	// 8's own text), so it asserts the refusal directly rather than the
+	// downstream NaN a different layer would compute.
+	{
+		const int32_t paddedDims = 32;
+		Rng rng(0x1207A15);
+		std::vector<int8_t> imgA, imgB;
+		XdQuery a{}, b{};
+		MakeRandomXdImage(rng, paddedDims, 1.0, imgA, a);
+		MakeRandomXdImage(rng, paddedDims, 1.0, imgB, b);
+		const QuerySegment segs[1] = {{0, paddedDims, -1.0f}};
+
+		float out = 12345.0f;
+		const Status st = ScoreXdPairSegmented(a, b, paddedDims, Metric::L2, segs, 1, &out);
+		CHECK_MSG(st == Status::InvalidArgument,
+			"L2, whole-row-negative-weight fixture: negative weight must be InvalidArgument, got "
+			"status %d, raw value %.9g (%s) (section 12 dim 8, D-SLM1315)",
+			static_cast<int>(st), static_cast<double>(out),
+			(st == Status::Ok && out < 0.0f)
+				? "executed: a negative raw total under Status::Ok -- sqrt of this in "
+				  "SelectDiverseMMR's L2 transform is the predicted NaN"
+				: "did not reproduce a negative raw total -- see value/status above");
+	}
+}
+
 // --- dim 6 (G-23): segmentCount == 0 (and segments == nullptr) is bit-
 // identical to ScoreXdPair, per metric branch -- load-bearing three times
 // over (section 6.2): it is why SelectDiverseMMR calls the segmented
@@ -21290,6 +21496,8 @@ int main()
 
 	// V3.4: ScoreXdPairSegmented -- new pairwise segmented weighted cross-device
 	// score (Gate 0b, drift-and-diversity plan §6.2).
+	TestScoreXdPairSegmentedNullSegmentsPositiveCountIsLegal();
+	TestScoreXdPairSegmentedNegativeWeightRefusal();
 	TestScoreXdPairSegmentedDegenerateIdentity();
 	TestScoreXdPairSegmentedDeterminism();
 	TestScoreXdPairSegmentedPayloadLawSymmetry();
