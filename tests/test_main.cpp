@@ -18286,8 +18286,9 @@ static void TestAllocFlatGraphAndNoveltyMisc()
 // comma-separated list in the same paragraph names 23, an internal
 // contradiction caught only by running the extractor and reconciling against
 // the header text itself, exactly the failure mode ceiling #4 warns about.
-// V3.4 added one entry point (diversity.h's SelectDiverseMMR), bringing the
-// total to 158 entry points across 154 registry rows.
+// V3.4 added two entry points: diversity.h's SelectDiverseMMR, and (Gate 0b's
+// rebuild, drift-and-diversity plan §6.1) analytics.h's ScoreXdPairSegmented --
+// bringing the total to 159 entry points across 155 registry rows.
 // ===========================================================================
 
 namespace
@@ -18342,7 +18343,7 @@ namespace
 			"TestAllocFlatWorkspaceReserveIndexScratch", 1},
 		{"alloc.h", "Workspace::IndexScratch", AllocBinding::Trivial, "TestAllocFlatWorkspaceAccessors", 1},
 
-		// --- analytics.h (10 entry points, all Binds) ---
+		// --- analytics.h (11 entry points, all Binds) ---
 		{"analytics.h", "ScoreXdPair", AllocBinding::Binds, "TestAllocFlatAnalyticsWholeVector", 1},
 		{"analytics.h", "CentroidDistanceCrossDevice", AllocBinding::Binds,
 			"TestAllocFlatAnalyticsWholeVector", 1},
@@ -18355,6 +18356,8 @@ namespace
 		{"analytics.h", "MaxNNCrossDeviceChannel", AllocBinding::Binds, "TestAllocFlatAnalyticsChannel", 1},
 		{"analytics.h", "SpreadCrossDeviceChannel", AllocBinding::Binds, "TestAllocFlatAnalyticsChannel", 1},
 		{"analytics.h", "ProjectionReport", AllocBinding::Binds, "TestAllocFlatProjectionReport", 1},
+		{"analytics.h", "ScoreXdPairSegmented", AllocBinding::Binds,
+			"TestAllocFlatAnalyticsSegmentedPair", 1},
 		// --- diversity.h (1 entry point) ---
 		{"diversity.h", "SelectDiverseMMR", AllocBinding::Binds, "TestAllocFlatDiversity", 1},
 
@@ -18527,7 +18530,7 @@ namespace
 	// nothing and passing "everything found has a row" vacuously.
 	struct HeaderExpectedCount { const char* header; int count; };
 	const HeaderExpectedCount kHeaderExpectedCounts[] = {
-		{"alloc.h", 26}, {"analytics.h", 10}, {"bake.h", 5}, {"compose.h", 4},
+		{"alloc.h", 26}, {"analytics.h", 11}, {"bake.h", 5}, {"compose.h", 4},
 		{"diversity.h", 1}, {"graph.h", 4}, {"inspector_common.h", 1}, {"kernels.h", 36},
 		{"matching.h", 1}, {"novelty.h", 4}, {"pca.h", 2}, {"query.h", 5},
 		{"scratch.h", 41}, {"superfaiss.h", 0}, {"topk.h", 6}, {"types.h", 8},
@@ -19885,14 +19888,657 @@ static void BuildRowQueries(const BankView& bank, int32_t count,
 	}
 }
 
-// Independent recode of the greedy MMR loop -- an oracle built on the already-trusted
-// ScoreXdPair primitive (not a re-test of ScoreXdPair itself), mirroring
-// SelectDiverseMMR's own spec (mean redundancy over already-selected members in selection
-// order, step-0 redundancy exactly 0, argmax with ascending-Hit.index tie-break) without
-// sharing any code with src/diversity.cpp.
+// ---------------------------------------------------------------------------
+// V3.4 Gate 0b core suite -- ScoreXdPairSegmented (new primitive, analytics.h/
+// .cpp) and SelectDiverseMMR's rebuilt redundancy term (diversity.h/.cpp),
+// authored red-first against the drift-and-diversity plan's Gate 0b
+// specification (Claude/Plans/SuperFAISSUnreal_3.4_DriftDiversity_Plan.md
+// sections 6.1/6.2/12, twenty-fifth revision). Every cell below traces to a
+// Coverage Model dimension (noted per cell) or is filed as a model gap in the
+// test-design case file (Claude/Curie/
+// superfaissunreal-3.4-gate0b-core-test-design-2026-08-06.md).
+//
+// SCOPE NOTE (case-file gap G-CORE-1, decision D-SLM1288): the plan widens
+// SelectDiverseMMR's signature by exactly "const QuerySegment* segments,
+// int32_t segmentCount" (plan section 6.2) and adds no parameter carrying the
+// Metric::L2 bank-intrinsic scale L, although section 6.2's own L2 bullet
+// specifies L2's relevance AND redundancy transforms as functions of L,
+// computed inside SelectDiverseMMR itself ("relevance = 1 - sqrt(candidates
+// [pos].score) / L"). There is no way to call the specified L2 path without
+// guessing where L enters the call, so this suite does not exercise
+// Metric::L2 through SelectDiverseMMR -- routed back to the planner, not
+// invented. ScoreXdPairSegmented's own L2 branch needs no L (it returns the
+// same raw squared-distance sense ScoreXdPair already does) and IS fully
+// covered below.
+// ---------------------------------------------------------------------------
+
+// Builds a random paddedDims-length int8 image with values in [-100, 100]
+// (well clear of the -128 payload-law boundary) and the matching XdQuery
+// (scale, sqSum) via the trusted-internal DotI8I8 self-dot recompute -- the
+// same construction the payload law itself checks, so every built payload is
+// valid by construction.
+static void MakeRandomXdImage(Rng& rng, int32_t paddedDims, double scale,
+	std::vector<int8_t>& image, XdQuery& query)
+{
+	image.resize(static_cast<size_t>(paddedDims));
+	for (auto& v : image)
+	{
+		v = static_cast<int8_t>(rng.NextIndex(201) - 100);
+	}
+	query.q8 = image.data();
+	query.scale = scale;
+	query.sqSum = detail::DotI8I8(image.data(), image.data(), paddedDims);
+}
+
+// |score| < FLT_MIN -> exactly 0.0f -- the subnormal-floor contract, reproduced
+// literally (not called) per this file's own established convention
+// (RefSelectDiverseMMR, below, does the same for the redundancy mean).
+static float RefXdFloor(double score)
+{
+	const double lim = 1.1754943508222875e-38;
+	if (score < lim && score > -lim)
+	{
+		return 0.0f;
+	}
+	return static_cast<float>(score);
+}
+
+// Independent per-range combines (dim 7): sum only over the CALLER's own
+// segment list -- gaps are simply absent from that list, so "a gap
+// contributes nothing" is the structural shape of iterating it, not a
+// separately modelled rule. Not sharing BuildScanRanges' gap-fill data
+// structure, or analytics.cpp's XdDot/XdL2/XdCosineDistance helpers, with
+// src/analytics.cpp or src/kernels.cpp.
+static double RefSegmentedDotRaw(const int8_t* a, const int8_t* b, double aScale, double bScale,
+	const QuerySegment* segments, int32_t segmentCount)
+{
+	double total = 0.0;
+	for (int32_t s = 0; s < segmentCount; ++s)
+	{
+		if (segments[s].weight == 0.0f) continue;
+		int64_t cross = 0;
+		for (int32_t i = segments[s].offset; i < segments[s].offset + segments[s].length; ++i)
+		{
+			cross += static_cast<int64_t>(a[i]) * static_cast<int64_t>(b[i]);
+		}
+		total += static_cast<double>(segments[s].weight) *
+			(static_cast<double>(cross) * aScale * bScale);
+	}
+	return total;
+}
+
+static double RefSegmentedL2Raw(const int8_t* a, const int8_t* b, double aScale, double bScale,
+	const QuerySegment* segments, int32_t segmentCount)
+{
+	double total = 0.0;
+	for (int32_t s = 0; s < segmentCount; ++s)
+	{
+		if (segments[s].weight == 0.0f) continue;
+		int64_t cross = 0, aSq = 0, bSq = 0;
+		for (int32_t i = segments[s].offset; i < segments[s].offset + segments[s].length; ++i)
+		{
+			cross += static_cast<int64_t>(a[i]) * static_cast<int64_t>(b[i]);
+			aSq += static_cast<int64_t>(a[i]) * static_cast<int64_t>(a[i]);
+			bSq += static_cast<int64_t>(b[i]) * static_cast<int64_t>(b[i]);
+		}
+		const double av = (aScale * aScale) * static_cast<double>(aSq);
+		const double bv = (bScale * bScale) * static_cast<double>(bSq);
+		const double cv = ((aScale * bScale) * static_cast<double>(cross)) * 2.0;
+		total += static_cast<double>(segments[s].weight) * ((av + bv) - cv);
+	}
+	return total;
+}
+
+// Per-range TRUE cosine (convention (ii), D-INSP-57's adopted closed form): a
+// live range whose per-range self-dot is zero on either operand floors that
+// range's cos_s to 0 (the same "zero sub-vector scores a defined 0" reading
+// XdChannelPairScore already establishes for this codebase's channel-scoped
+// Cosine arithmetic, named as this plan section's own precedent). `outWeighted
+// ASq`/`outWeightedBSq` are the aggregate weighted self-norms the public-
+// boundary ZeroNormQuery trigger is specified against (section 6.2's
+// "weighted self-norm ... exactly zero").
+static double RefSegmentedCosineRaw(const int8_t* a, const int8_t* b,
+	const QuerySegment* segments, int32_t segmentCount, double* outWeightedASq,
+	double* outWeightedBSq)
+{
+	double raw = 0.0, wASq = 0.0, wBSq = 0.0;
+	for (int32_t s = 0; s < segmentCount; ++s)
+	{
+		if (segments[s].weight == 0.0f) continue;
+		int64_t cross = 0, aSq = 0, bSq = 0;
+		for (int32_t i = segments[s].offset; i < segments[s].offset + segments[s].length; ++i)
+		{
+			cross += static_cast<int64_t>(a[i]) * static_cast<int64_t>(b[i]);
+			aSq += static_cast<int64_t>(a[i]) * static_cast<int64_t>(a[i]);
+			bSq += static_cast<int64_t>(b[i]) * static_cast<int64_t>(b[i]);
+		}
+		const double w = static_cast<double>(segments[s].weight);
+		wASq += w * static_cast<double>(aSq);
+		wBSq += w * static_cast<double>(bSq);
+		const double cos_s = (aSq == 0 || bSq == 0)
+			? 0.0
+			: static_cast<double>(cross) /
+				std::sqrt(static_cast<double>(aSq) * static_cast<double>(bSq));
+		raw += w * (1.0 - cos_s);
+	}
+	if (outWeightedASq) *outWeightedASq = wASq;
+	if (outWeightedBSq) *outWeightedBSq = wBSq;
+	return raw;
+}
+
+// --- dim 6 (G-23): segmentCount == 0 (and segments == nullptr) is bit-
+// identical to ScoreXdPair, per metric branch -- load-bearing three times
+// over (section 6.2): it is why SelectDiverseMMR calls the segmented
+// primitive unconditionally, it anchors every per-metric degenerate identity,
+// and it is what "the number a user already sees on an unchannelled bank
+// does not move" rests on.
+static void TestScoreXdPairSegmentedDegenerateIdentity()
+{
+	std::printf("ScoreXdPairSegmented: degenerate segmentCount==0 identity (dim 6, G-23)\n");
+	const Metric metrics[3] = {Metric::Dot, Metric::L2, Metric::Cosine};
+	const char* names[3] = {"dot", "L2", "cosine"};
+	for (int32_t m = 0; m < 3; ++m)
+	{
+		Rng rng(0x5E6DEE00ull + static_cast<uint64_t>(m));
+		const int32_t paddedDims = 64;
+		std::vector<int8_t> imgA, imgB;
+		XdQuery a{}, b{};
+		MakeRandomXdImage(rng, paddedDims, 0.03125, imgA, a);
+		MakeRandomXdImage(rng, paddedDims, 0.0625, imgB, b);
+
+		float refScore = 0.0f;
+		const Status refSt = ScoreXdPair(a, b, paddedDims, metrics[m], &refScore);
+		CHECK(refSt == Status::Ok);
+
+		// Spelling 1: segments == nullptr, segmentCount == 0.
+		float segScoreNull = -12345.0f;
+		const Status stNull =
+			ScoreXdPairSegmented(a, b, paddedDims, metrics[m], nullptr, 0, &segScoreNull);
+		CHECK_MSG(stNull == refSt, "%s: segments==nullptr status %d != ScoreXdPair status %d",
+			names[m], static_cast<int>(stNull), static_cast<int>(refSt));
+		if (refSt == Status::Ok)
+		{
+			CHECK_MSG(segScoreNull == refScore,
+				"%s: segments==nullptr score %.9g != ScoreXdPair %.9g (not bit-identical)",
+				names[m], static_cast<double>(segScoreNull), static_cast<double>(refScore));
+		}
+
+		// Spelling 2: segments != nullptr, segmentCount == 0 -- the count, not
+		// the pointer, is what selects the degenerate path.
+		const QuerySegment unusedSeg[1] = {{0, 16, 1.0f}};
+		float segScoreZero = -12345.0f;
+		const Status stZero =
+			ScoreXdPairSegmented(a, b, paddedDims, metrics[m], unusedSeg, 0, &segScoreZero);
+		CHECK_MSG(stZero == refSt, "%s: segmentCount==0 status %d != ScoreXdPair status %d",
+			names[m], static_cast<int>(stZero), static_cast<int>(refSt));
+		if (refSt == Status::Ok)
+		{
+			CHECK_MSG(segScoreZero == refScore,
+				"%s: segmentCount==0 score %.9g != ScoreXdPair %.9g (not bit-identical)", names[m],
+				static_cast<double>(segScoreZero), static_cast<double>(refScore));
+		}
+	}
+}
+
+// --- dim 6: repeat-call determinism per metric branch, distinct from
+// SelectDiverseMMR's own tie-break determinism cell (which tests only the
+// coarser, downstream selection outcome of a tie, not the scalar this
+// primitive itself returns).
+static void TestScoreXdPairSegmentedDeterminism()
+{
+	std::printf("ScoreXdPairSegmented: repeat-call determinism per metric (dim 6)\n");
+	const Metric metrics[3] = {Metric::Dot, Metric::L2, Metric::Cosine};
+	for (int32_t m = 0; m < 3; ++m)
+	{
+		Rng rng(0x6DE7E4A1ull + static_cast<uint64_t>(m));
+		const int32_t paddedDims = 48;
+		std::vector<int8_t> imgA, imgB;
+		XdQuery a{}, b{};
+		MakeRandomXdImage(rng, paddedDims, 0.05, imgA, a);
+		MakeRandomXdImage(rng, paddedDims, 0.02, imgB, b);
+		const QuerySegment segments[2] = {{0, 16, 1.25f}, {32, 16, 0.75f}};
+
+		float s1 = 0.0f, s2 = 0.0f;
+		const Status st1 =
+			ScoreXdPairSegmented(a, b, paddedDims, metrics[m], segments, 2, &s1);
+		const Status st2 =
+			ScoreXdPairSegmented(a, b, paddedDims, metrics[m], segments, 2, &s2);
+		CHECK(st1 == st2);
+		if (st1 == Status::Ok && st2 == Status::Ok)
+		{
+			CHECK_MSG(s1 == s2, "metric %d: repeat calls diverged: %.9g vs %.9g",
+				static_cast<int>(metrics[m]), static_cast<double>(s1), static_cast<double>(s2));
+		}
+	}
+}
+
+// --- dim 2: "the identical payload law ScoreXdPair already enforces" is new
+// code implementing pre-existing behaviour, not already covered by
+// ScoreXdPair's own tests (section 12 dim 2) -- prove symmetry across the two
+// entry paths, per violation class, not merely that each independently
+// rejects.
+static void TestScoreXdPairSegmentedPayloadLawSymmetry()
+{
+	std::printf("ScoreXdPairSegmented: payload-law symmetry with ScoreXdPair (dim 2)\n");
+	const int32_t paddedDims = 32;
+	Rng rng(0x9A1FA0);
+	std::vector<int8_t> imgGood;
+	XdQuery good{};
+	MakeRandomXdImage(rng, paddedDims, 1.0, imgGood, good);
+	const QuerySegment segFull[1] = {{0, paddedDims, 1.0f}};
+
+	auto checkSymmetric = [&](const XdQuery& a, const XdQuery& b, int32_t pd, const char* label)
+	{
+		float refOut = 0.0f;
+		const Status refSt = ScoreXdPair(a, b, pd, Metric::Dot, &refOut);
+		float segOut = 0.0f;
+		const Status segSt = ScoreXdPairSegmented(a, b, pd, Metric::Dot, segFull, 1, &segOut);
+		CHECK_MSG(segSt == refSt,
+			"%s: ScoreXdPairSegmented status %d != ScoreXdPair status %d", label,
+			static_cast<int>(segSt), static_cast<int>(refSt));
+	};
+
+	checkSymmetric(good, good, 0, "paddedDims == 0");
+	checkSymmetric(good, good, kMaxCrossDeviceDims + 1, "paddedDims > kMaxCrossDeviceDims");
+	{
+		XdQuery nanScale = good;
+		nanScale.scale = std::numeric_limits<double>::quiet_NaN();
+		checkSymmetric(nanScale, good, paddedDims, "non-finite scale (a)");
+	}
+	{
+		XdQuery negScale = good;
+		negScale.scale = -1.0;
+		checkSymmetric(negScale, good, paddedDims, "negative scale (a)");
+	}
+	{
+		std::vector<int8_t> badImage = imgGood;
+		badImage[0] = -128;
+		const XdQuery badQ{badImage.data(), 1.0,
+			detail::DotI8I8(imgGood.data(), imgGood.data(), paddedDims)};
+		checkSymmetric(badQ, good, paddedDims, "-128 element (a)");
+	}
+	{
+		XdQuery desynced = good;
+		desynced.sqSum = good.sqSum + 1;
+		checkSymmetric(desynced, good, paddedDims, "desynced sqSum (a)");
+	}
+
+	// The negative side of this symmetry: well-formed payloads must be
+	// accepted by both -- a validator that over-rejects is caught here too.
+	{
+		float refOut = 0.0f, segOut = 0.0f;
+		CHECK(ScoreXdPair(good, good, paddedDims, Metric::Dot, &refOut) == Status::Ok);
+		CHECK(ScoreXdPairSegmented(good, good, paddedDims, Metric::Dot, segFull, 1, &segOut) ==
+			Status::Ok);
+	}
+}
+
+// --- dim 2/5 (G-28): the local validator (section 6.2) enforces
+// ValidateSegments' structural rules directly, not by calling it: offsets/
+// lengths positive, on the 16-byte element grid, ascending and non-
+// overlapping, ending within paddedDims, weights finite -- InvalidArgument on
+// any violation; and, the one deliberate departure, segmentCount == 0 (or
+// nullptr) is NOT refused.
+static void TestScoreXdPairSegmentedLocalValidator()
+{
+	std::printf("ScoreXdPairSegmented: local validator structural rules (dim 2/5, G-28)\n");
+	const int32_t paddedDims = 64;
+	Rng rng(0xB0A71D);
+	std::vector<int8_t> imgA, imgB;
+	XdQuery a{}, b{};
+	MakeRandomXdImage(rng, paddedDims, 1.0, imgA, a);
+	MakeRandomXdImage(rng, paddedDims, 1.0, imgB, b);
+
+	auto expectInvalid = [&](const QuerySegment* segs, int32_t count, const char* label)
+	{
+		float out = 0.0f;
+		const Status st = ScoreXdPairSegmented(a, b, paddedDims, Metric::Dot, segs, count, &out);
+		CHECK_MSG(st == Status::InvalidArgument, "%s: expected InvalidArgument, got %d", label,
+			static_cast<int>(st));
+	};
+
+	{ const QuerySegment s[1] = {{-16, 16, 1.0f}}; expectInvalid(s, 1, "negative offset"); }
+	{ const QuerySegment s[1] = {{0, 0, 1.0f}}; expectInvalid(s, 1, "non-positive length"); }
+	{ const QuerySegment s[1] = {{0, -16, 1.0f}}; expectInvalid(s, 1, "negative length"); }
+	{ const QuerySegment s[1] = {{8, 16, 1.0f}}; expectInvalid(s, 1, "off-grid offset"); }
+	{ const QuerySegment s[1] = {{0, 8, 1.0f}}; expectInvalid(s, 1, "off-grid length"); }
+	{ const QuerySegment s[2] = {{16, 16, 1.0f}, {0, 16, 1.0f}}; expectInvalid(s, 2, "unsorted"); }
+	{ const QuerySegment s[2] = {{0, 32, 1.0f}, {16, 16, 1.0f}};
+		expectInvalid(s, 2, "overlapping"); }
+	{ const QuerySegment s[1] = {{48, 32, 1.0f}};
+		expectInvalid(s, 1, "extends past paddedDims"); }
+	{
+		QuerySegment s[kMaxSegments + 1];
+		for (int32_t i = 0; i <= kMaxSegments; ++i)
+		{
+			s[i] = {(i * 16) % paddedDims, 16, 1.0f};
+		}
+		expectInvalid(s, kMaxSegments + 1, "segmentCount > kMaxSegments");
+	}
+	{ const QuerySegment s[1] = {{0, 16, std::numeric_limits<float>::quiet_NaN()}};
+		expectInvalid(s, 1, "non-finite weight"); }
+	{
+		float out = 0.0f;
+		const Status st =
+			ScoreXdPairSegmented(a, b, paddedDims, Metric::Dot, nullptr, -1, &out);
+		CHECK_MSG(st == Status::InvalidArgument,
+			"negative segmentCount: expected InvalidArgument, got %d", static_cast<int>(st));
+	}
+
+	// The one deliberate departure: segmentCount == 0 (or nullptr) is NOT
+	// refused -- it is the degenerate full-row path.
+	{
+		float out = 0.0f;
+		CHECK(ScoreXdPairSegmented(a, b, paddedDims, Metric::Dot, nullptr, 0, &out) == Status::Ok);
+		const QuerySegment ignored[1] = {{0, 16, 1.0f}}; // present but count is 0: still degenerate
+		CHECK(ScoreXdPairSegmented(a, b, paddedDims, Metric::Dot, ignored, 0, &out) == Status::Ok);
+	}
+
+	// The negative side: a well-formed segment list must be accepted.
+	{
+		const QuerySegment s[2] = {{0, 16, 1.0f}, {32, 16, 1.0f}};
+		float out = 0.0f;
+		CHECK(ScoreXdPairSegmented(a, b, paddedDims, Metric::Dot, s, 2, &out) == Status::Ok);
+	}
+}
+
+// --- dim 8: the agreement cell section 6.2 owes ValidateSegments --
+// ScoreXdPairSegmented's local validator is a second, independently written
+// implementation of ValidateSegments' structural rules, not shared code;
+// confirm both reject/accept the SAME malformed/well-formed segment lists on
+// their SHARED rules (grid alignment, ascending/non-overlap, within
+// paddedDims, finite weight) -- excluding the two properties that do not
+// transfer (ValidateSegments' count lower bound of 1, and its separate
+// per-segment zero-sub-norm trigger, both named in section 6.2 as deliberate
+// departures, not defects to agree on).
+static void TestScoreXdPairSegmentedValidatorAgreement()
+{
+	std::printf("ScoreXdPairSegmented vs ValidateSegments: structural-rule agreement (dim 8)\n");
+	const int32_t paddedDims = 64;
+	std::vector<float> paddedQuery(static_cast<size_t>(paddedDims), 1.0f); // nonzero everywhere
+	BankView bank{};
+	bank.paddedDims = paddedDims;
+	bank.quant = Quantization::Int8;
+	bank.metric = Metric::Dot; // Dot: ValidateSegments' Cosine-only zero-norm rule never fires
+
+	Rng rng(0xC0FFEE1);
+	std::vector<int8_t> imgA, imgB;
+	XdQuery a{}, b{};
+	MakeRandomXdImage(rng, paddedDims, 1.0, imgA, a);
+	MakeRandomXdImage(rng, paddedDims, 1.0, imgB, b);
+
+	auto agree = [&](const QuerySegment* segs, int32_t count, const char* label)
+	{
+		const Status vs = ValidateSegments(bank, paddedQuery.data(), segs, count);
+		float out = 0.0f;
+		const Status local = ScoreXdPairSegmented(a, b, paddedDims, Metric::Dot, segs, count, &out);
+		const bool vsValid = (vs == Status::Ok);
+		const bool localValid = (local != Status::InvalidArgument);
+		CHECK_MSG(vsValid == localValid,
+			"%s: ValidateSegments %s, local validator %s -- structural rules disagree", label,
+			vsValid ? "accepted" : "rejected", localValid ? "accepted" : "rejected");
+	};
+
+	{ const QuerySegment s[1] = {{8, 16, 1.0f}}; agree(s, 1, "off-grid offset"); }
+	{ const QuerySegment s[1] = {{0, 8, 1.0f}}; agree(s, 1, "off-grid length"); }
+	{ const QuerySegment s[2] = {{16, 16, 1.0f}, {0, 16, 1.0f}}; agree(s, 2, "unsorted"); }
+	{ const QuerySegment s[2] = {{0, 32, 1.0f}, {16, 16, 1.0f}}; agree(s, 2, "overlapping"); }
+	{ const QuerySegment s[1] = {{48, 32, 1.0f}}; agree(s, 1, "extends past paddedDims"); }
+	{ const QuerySegment s[1] = {{0, 16, std::numeric_limits<float>::quiet_NaN()}};
+		agree(s, 1, "non-finite weight"); }
+	{ const QuerySegment s[2] = {{0, 16, 1.0f}, {32, 16, 1.0f}}; agree(s, 2, "well-formed"); }
+}
+
+// --- dim 2/5 (G-28): Metric::Cosine's ONE trigger is the aggregate weighted
+// self-norm (either operand) being exactly zero; a row zero-content on only
+// one of several weighted channels (nonzero weighted self-norm overall) does
+// NOT refuse -- the side of this boundary that only exists once the second,
+// per-segment ValidateSegments-style zero-sub-norm rule is removed.
+static void TestScoreXdPairSegmentedCosineZeroNormBoundary()
+{
+	std::printf("ScoreXdPairSegmented: Cosine weighted-zero-norm boundary (dim 2/5, G-28)\n");
+	const int32_t paddedDims = 32;
+	const QuerySegment segs[2] = {{0, 16, 1.0f}, {16, 16, 1.0f}};
+
+	// Candidate zero-content on EVERY weighted channel: aggregate weighted
+	// self-norm is exactly 0 -> ZeroNormQuery.
+	{
+		std::vector<int8_t> zeroImg(static_cast<size_t>(paddedDims), 0);
+		std::vector<int8_t> liveImg(static_cast<size_t>(paddedDims), 0);
+		liveImg[0] = 5;
+		liveImg[20] = 3;
+		const XdQuery zero{zeroImg.data(), 1.0, 0};
+		const XdQuery live{liveImg.data(), 1.0,
+			detail::DotI8I8(liveImg.data(), liveImg.data(), paddedDims)};
+		float out = 0.0f;
+		const Status st = ScoreXdPairSegmented(zero, live, paddedDims, Metric::Cosine, segs, 2, &out);
+		CHECK_MSG(st == Status::ZeroNormQuery,
+			"zero-content on every weighted channel: expected ZeroNormQuery, got %d",
+			static_cast<int>(st));
+	}
+
+	// A channel weight driven to exactly 0 on every channel a candidate
+	// carries live content on: the row has content, but nothing it is
+	// weighted on -- the same trigger, reached the other way.
+	{
+		std::vector<int8_t> contentOnlyInSeg0(static_cast<size_t>(paddedDims), 0);
+		contentOnlyInSeg0[0] = 7;
+		std::vector<int8_t> otherImg(static_cast<size_t>(paddedDims), 0);
+		otherImg[16] = 4;
+		const QuerySegment weightSeg1Zero[2] = {{0, 16, 0.0f}, {16, 16, 1.0f}};
+		const XdQuery cand{contentOnlyInSeg0.data(), 1.0,
+			detail::DotI8I8(contentOnlyInSeg0.data(), contentOnlyInSeg0.data(), paddedDims)};
+		const XdQuery other{otherImg.data(), 1.0,
+			detail::DotI8I8(otherImg.data(), otherImg.data(), paddedDims)};
+		float out = 0.0f;
+		const Status st =
+			ScoreXdPairSegmented(cand, other, paddedDims, Metric::Cosine, weightSeg1Zero, 2, &out);
+		CHECK_MSG(st == Status::ZeroNormQuery,
+			"content only on a weight-0 channel: expected ZeroNormQuery, got %d",
+			static_cast<int>(st));
+	}
+
+	// A row zero-content on only ONE of several weighted channels (nonzero
+	// weighted self-norm overall): does NOT refuse -- a defined, finite score.
+	{
+		std::vector<int8_t> partialImg(static_cast<size_t>(paddedDims), 0);
+		partialImg[20] = 6; // live only in segment 1 [16,32); segment 0 is zero-content
+		std::vector<int8_t> otherImg(static_cast<size_t>(paddedDims), 0);
+		otherImg[0] = 2;
+		otherImg[18] = 3;
+		const XdQuery partial{partialImg.data(), 1.0,
+			detail::DotI8I8(partialImg.data(), partialImg.data(), paddedDims)};
+		const XdQuery other{otherImg.data(), 1.0,
+			detail::DotI8I8(otherImg.data(), otherImg.data(), paddedDims)};
+		float out = -999.0f;
+		const Status st =
+			ScoreXdPairSegmented(partial, other, paddedDims, Metric::Cosine, segs, 2, &out);
+		CHECK_MSG(st == Status::Ok,
+			"zero-content on one of several weighted channels must NOT refuse, got status %d",
+			static_cast<int>(st));
+		CHECK_MSG(out == out, "one-channel-zero Cosine combine produced NaN");
+	}
+}
+
+// --- dim 7: per-metric combine, cross-checked against an independent
+// per-range recode (RefSegmented*Raw, above) that shares no code with
+// src/analytics.cpp or src/kernels.cpp's BuildScanRanges -- proves the
+// specified combine, not merely that some value comes out. The fixture's gap
+// [16,32) is present in the resolved range list (BuildScanRanges' own
+// gap-fill) but absent from the segment list the Ref sums over, so "a gap
+// contributes nothing" is what this cell's agreement with the real function
+// proves.
+static void TestScoreXdPairSegmentedPerMetricCombine()
+{
+	std::printf("ScoreXdPairSegmented: per-metric combine vs independent recode (dim 7)\n");
+	const int32_t paddedDims = 64;
+	const QuerySegment segs[2] = {{0, 16, 1.5f}, {32, 16, 0.5f}};
+	Rng rng(0xD1550);
+	std::vector<int8_t> imgA, imgB;
+	XdQuery a{}, b{};
+	MakeRandomXdImage(rng, paddedDims, 0.04, imgA, a);
+	MakeRandomXdImage(rng, paddedDims, 0.02, imgB, b);
+
+	{
+		float out = 0.0f;
+		CHECK(ScoreXdPairSegmented(a, b, paddedDims, Metric::Dot, segs, 2, &out) == Status::Ok);
+		const float expected = RefXdFloor(
+			RefSegmentedDotRaw(imgA.data(), imgB.data(), a.scale, b.scale, segs, 2));
+		CHECK_MSG(out == expected, "Dot combine: got %.9g, expected %.9g",
+			static_cast<double>(out), static_cast<double>(expected));
+	}
+	{
+		float out = 0.0f;
+		CHECK(ScoreXdPairSegmented(a, b, paddedDims, Metric::L2, segs, 2, &out) == Status::Ok);
+		const float expected = RefXdFloor(
+			RefSegmentedL2Raw(imgA.data(), imgB.data(), a.scale, b.scale, segs, 2));
+		CHECK_MSG(out == expected, "L2 combine: got %.9g, expected %.9g",
+			static_cast<double>(out), static_cast<double>(expected));
+	}
+	{
+		float out = 0.0f;
+		const Status st = ScoreXdPairSegmented(a, b, paddedDims, Metric::Cosine, segs, 2, &out);
+		double wASq = 0.0, wBSq = 0.0;
+		const double raw = RefSegmentedCosineRaw(imgA.data(), imgB.data(), segs, 2, &wASq, &wBSq);
+		if (wASq == 0.0 || wBSq == 0.0)
+		{
+			CHECK(st == Status::ZeroNormQuery);
+		}
+		else
+		{
+			CHECK(st == Status::Ok);
+			const float expected = RefXdFloor(raw);
+			CHECK_MSG(out == expected, "Cosine combine: got %.9g, expected %.9g",
+				static_cast<double>(out), static_cast<double>(expected));
+		}
+	}
+}
+
+// --- dim 4 (G-27): segment-COUNT extremes -- 0 (degenerate, covered above),
+// 1, and kMaxSegments (constructed non-contiguous, reaching the documented
+// worst-case 2*kMaxSegments+1 = 17-range resolved list).
+static void TestScoreXdPairSegmentedSegmentCountExtremes()
+{
+	std::printf("ScoreXdPairSegmented: segment-count extremes 0/1/kMaxSegments (dim 4, G-27)\n");
+	Rng rng(0xE7112E);
+
+	{
+		const int32_t paddedDims = 32;
+		std::vector<int8_t> imgA, imgB;
+		XdQuery a{}, b{};
+		MakeRandomXdImage(rng, paddedDims, 1.0, imgA, a);
+		MakeRandomXdImage(rng, paddedDims, 1.0, imgB, b);
+		const QuerySegment segs[1] = {{0, 16, 1.0f}};
+		float out = 0.0f;
+		CHECK(ScoreXdPairSegmented(a, b, paddedDims, Metric::Dot, segs, 1, &out) == Status::Ok);
+		const float expected =
+			RefXdFloor(RefSegmentedDotRaw(imgA.data(), imgB.data(), a.scale, b.scale, segs, 1));
+		CHECK(out == expected);
+	}
+
+	{
+		const int32_t segLen = 16;
+		const int32_t stride = 32; // 16-wide segment + a 16-wide gap before it
+		const int32_t paddedDims = kMaxSegments * stride + segLen; // + a trailing gap
+		std::vector<int8_t> imgA, imgB;
+		XdQuery a{}, b{};
+		MakeRandomXdImage(rng, paddedDims, 0.1, imgA, a);
+		MakeRandomXdImage(rng, paddedDims, 0.2, imgB, b);
+		QuerySegment segs[kMaxSegments];
+		for (int32_t i = 0; i < kMaxSegments; ++i)
+		{
+			segs[i] = {i * stride + 16, segLen, 1.0f + 0.1f * static_cast<float>(i)};
+		}
+		float out = 0.0f;
+		CHECK(ScoreXdPairSegmented(a, b, paddedDims, Metric::Dot, segs, kMaxSegments, &out) ==
+			Status::Ok);
+		const float expected = RefXdFloor(RefSegmentedDotRaw(imgA.data(), imgB.data(), a.scale,
+			b.scale, segs, kMaxSegments));
+		CHECK_MSG(out == expected,
+			"kMaxSegments non-contiguous (17-range worst case): got %.9g, expected %.9g",
+			static_cast<double>(out), static_cast<double>(expected));
+	}
+}
+
+// --- dim 7 (D-INSP-57): the adopted combine (convention (ii), the S-C form)
+// is degree-1 homogeneous in the weight vector -- scaling every weight by a
+// positive constant k scales the raw output by exactly k. Convention (i)
+// (rejected, section 6.2) is degree-0 and would fail this cell outright;
+// measured exact, not within a tolerance.
+static void TestScoreXdPairSegmentedCosineHomogeneity()
+{
+	std::printf(
+		"ScoreXdPairSegmented: Cosine raw combine is degree-1 homogeneous (dim 7, D-INSP-57)\n");
+	const int32_t paddedDims = 48;
+	Rng rng(0xF00D5EED);
+	std::vector<int8_t> imgA, imgB;
+	XdQuery a{}, b{};
+	MakeRandomXdImage(rng, paddedDims, 1.0, imgA, a);
+	MakeRandomXdImage(rng, paddedDims, 1.0, imgB, b);
+
+	const QuerySegment w1[2] = {{0, 16, 0.6f}, {32, 16, 1.3f}};
+	const QuerySegment w2[2] = {{0, 16, 1.2f}, {32, 16, 2.6f}}; // exactly 2x w1
+
+	float out1 = 0.0f, out2 = 0.0f;
+	const Status st1 = ScoreXdPairSegmented(a, b, paddedDims, Metric::Cosine, w1, 2, &out1);
+	const Status st2 = ScoreXdPairSegmented(a, b, paddedDims, Metric::Cosine, w2, 2, &out2);
+	CHECK(st1 == Status::Ok);
+	CHECK(st2 == Status::Ok);
+	if (st1 == Status::Ok && st2 == Status::Ok)
+	{
+		CHECK_MSG(out2 == RefXdFloor(2.0 * static_cast<double>(out1)),
+			"2x-weight raw combine %.9g != 2x the weight-1 raw combine %.9g (degree-1 broken)",
+			static_cast<double>(out2), static_cast<double>(out1));
+	}
+}
+
+// Coverage audit section 7's allocation-cell registry requires every public
+// entry point to be classified and, if binding, proven flat.
+// ScoreXdPairSegmented is new code implementing a bounded local validator, a
+// fixed-size working range array (2*kMaxSegments+1), and the same
+// fixed-order double epilogue every other analytics.h operator uses -- no
+// internal collection.
+static void TestAllocFlatAnalyticsSegmentedPair()
+{
+	Rng rng(0xA110C);
+	const int32_t paddedDims = 48;
+	std::vector<int8_t> imgA, imgB;
+	XdQuery a{}, b{};
+	MakeRandomXdImage(rng, paddedDims, 1.0, imgA, a);
+	MakeRandomXdImage(rng, paddedDims, 1.0, imgB, b);
+	const QuerySegment segs[2] = {{0, 16, 1.0f}, {32, 16, 1.0f}};
+	float out = 0.0f;
+
+	CHECK(ScoreXdPairSegmented(a, b, paddedDims, Metric::Dot, segs, 2, &out) == Status::Ok);
+
+	const uint64_t allocsBefore = AllocationCount();
+	{
+		ScopedRawNewTracking rawTracking;
+		for (int32_t i = 0; i < 10; ++i)
+		{
+			CHECK(ScoreXdPairSegmented(a, b, paddedDims, Metric::Dot, segs, 2, &out) == Status::Ok);
+		}
+		CHECK_MSG(rawTracking.Count() == 0,
+			"ScoreXdPairSegmented allocated %llu time(s) outside the seam",
+			static_cast<unsigned long long>(rawTracking.Count()));
+	}
+	CHECK(AllocationCount() == allocsBefore);
+}
+
+// ---------------------------------------------------------------------------
+// SelectDiverseMMR -- the rebuilt redundancy term (diversity.h/.cpp).
+
+// Independent recode of the greedy MMR loop under the CORRECTED section 6.2
+// redundancy specification -- an oracle built on the already-trusted
+// ScoreXdPairSegmented primitive (proven standalone above), not a re-test of
+// it, and not sharing the per-metric transform code with src/diversity.cpp.
+// Metric::L2 is intentionally absent -- case-file gap G-CORE-1, D-SLM1288:
+// the plan's own widened signature carries no parameter for the
+// bank-intrinsic scale L2's relevance/redundancy transform requires.
 static Status RefSelectDiverseMMR(
 	const Hit* candidates, const XdQuery* candidateQueries, int32_t candidateCount,
 	int32_t paddedDims, Metric metric, float lambda, int32_t k,
+	const QuerySegment* segments, int32_t segmentCount,
 	int32_t* outSelectedIndices, float* outRelevance, float* outRedundancy)
 {
 	const double lim = 1.1754943508222875e-38; // FLT_MIN, exactly -- the subnormal floor.
@@ -19912,14 +20558,38 @@ static Status RefSelectDiverseMMR(
 			double acc = 0.0;
 			for (int32_t s = 0; s < step; ++s)
 			{
-				float pair = 0.0f;
-				const Status st = ScoreXdPair(candidateQueries[pos],
-					candidateQueries[outSelectedIndices[s]], paddedDims, metric, &pair);
+				float raw = 0.0f;
+				const Status st = ScoreXdPairSegmented(candidateQueries[pos],
+					candidateQueries[outSelectedIndices[s]], paddedDims, metric, segments,
+					segmentCount, &raw);
 				if (st != Status::Ok)
 				{
 					return st;
 				}
-				acc += static_cast<double>(pair);
+				// The per-metric redundancy transform (section 6.2): Dot is
+				// the identity; Cosine recovers sum(weight_s) - raw.
+				double transformed = 0.0;
+				if (metric == Metric::Dot)
+				{
+					transformed = static_cast<double>(raw);
+				}
+				else if (metric == Metric::Cosine)
+				{
+					double sumWeight = 0.0;
+					if (segmentCount == 0 || segments == nullptr)
+					{
+						sumWeight = 1.0;
+					}
+					else
+					{
+						for (int32_t si = 0; si < segmentCount; ++si)
+						{
+							sumWeight += static_cast<double>(segments[si].weight);
+						}
+					}
+					transformed = sumWeight - static_cast<double>(raw);
+				}
+				acc += transformed;
 			}
 			float redundancy = 0.0f;
 			if (step > 0)
@@ -19948,15 +20618,19 @@ static Status RefSelectDiverseMMR(
 
 static void TestDiversityMMR()
 {
-	std::printf("diversity (V3.4): greedy MMR selection\n");
+	std::printf(
+		"diversity (V3.4, Gate 0b rebuild): greedy MMR selection, corrected redundancy term\n");
+	std::printf(
+		"  (Metric::L2 excluded -- case-file gap G-CORE-1, D-SLM1288: SelectDiverseMMR's\n"
+		"   widened signature carries no parameter for L2's bank-intrinsic scale L)\n");
 
-	const Metric metrics[3] = {Metric::Dot, Metric::Cosine, Metric::L2};
-	const char* names[3] = {"dot", "cosine", "L2"};
+	const Metric metrics[2] = {Metric::Dot, Metric::Cosine};
+	const char* names[2] = {"dot", "cosine"};
 
-	for (int32_t m = 0; m < 3; ++m)
+	for (int32_t m = 0; m < 2; ++m)
 	{
 		Rng rng(0xD1FE5170ull + static_cast<uint64_t>(m));
-		const int32_t dims = 16, bankCount = 24, candidateCount = 10, k = 5;
+		const int32_t dims = 32, bankCount = 24, candidateCount = 10, k = 5;
 		TestBank bank(rng, bankCount, dims, Quantization::Int8, metrics[m]);
 
 		std::vector<std::vector<int8_t>> images;
@@ -19972,16 +20646,16 @@ static void TestDiversityMMR()
 				i, static_cast<float>(candidateCount - i) + 0.001f * static_cast<float>(i)};
 		}
 
-		// --- lambda == 1: reduces to relevance order, independent of redundancy, and the
-		// first-selection redundancy convention holds (exactly 0, never a reduction over
-		// zero terms).
+		// --- lambda == 1, channelless (segmentCount == 0): reduces to relevance
+		// order, independent of redundancy, and the first-selection redundancy
+		// convention holds (exactly 0, never a reduction over zero terms).
 		{
 			std::vector<int32_t> sel(static_cast<size_t>(k), -1);
 			std::vector<float> rel(static_cast<size_t>(k), 0.0f);
 			std::vector<float> red(static_cast<size_t>(k), -1.0f);
 			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				bank.view.paddedDims, metrics[m], 1.0f, k, sel.data(), rel.data(), red.data()) ==
-				Status::Ok);
+				bank.view.paddedDims, metrics[m], 1.0f, k, nullptr, 0, sel.data(), rel.data(),
+				red.data()) == Status::Ok);
 			for (int32_t i = 0; i < k; ++i)
 			{
 				CHECK_MSG(sel[static_cast<size_t>(i)] == i,
@@ -19993,9 +20667,10 @@ static void TestDiversityMMR()
 				static_cast<double>(red[0]));
 		}
 
-		// --- lambda < 1: cross-checked against an independent recode of the same
-		// algorithm (RefSelectDiverseMMR), and the first pick is still the most-relevant
-		// candidate regardless of lambda (the spec's positive-scalar-multiple claim).
+		// --- lambda < 1, channelless: cross-checked against RefSelectDiverseMMR's
+		// corrected redundancy transform, and the first pick is still the
+		// most-relevant candidate regardless of lambda (the spec's
+		// positive-scalar-multiple claim).
 		const float lambdas[3] = {0.0f, 0.3f, 0.7f};
 		for (int32_t li = 0; li < 3; ++li)
 		{
@@ -20004,15 +20679,15 @@ static void TestDiversityMMR()
 			std::vector<float> rel(static_cast<size_t>(k), 0.0f);
 			std::vector<float> red(static_cast<size_t>(k), -1.0f);
 			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				bank.view.paddedDims, metrics[m], lambda, k, sel.data(), rel.data(), red.data()) ==
-				Status::Ok);
+				bank.view.paddedDims, metrics[m], lambda, k, nullptr, 0, sel.data(), rel.data(),
+				red.data()) == Status::Ok);
 
 			std::vector<int32_t> refSel(static_cast<size_t>(k), -1);
 			std::vector<float> refRel(static_cast<size_t>(k), 0.0f);
 			std::vector<float> refRed(static_cast<size_t>(k), -1.0f);
 			CHECK(RefSelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				bank.view.paddedDims, metrics[m], lambda, k, refSel.data(), refRel.data(),
-				refRed.data()) == Status::Ok);
+				bank.view.paddedDims, metrics[m], lambda, k, nullptr, 0, refSel.data(),
+				refRel.data(), refRed.data()) == Status::Ok);
 
 			for (int32_t i = 0; i < k; ++i)
 			{
@@ -20034,14 +20709,68 @@ static void TestDiversityMMR()
 			std::vector<float> relA(static_cast<size_t>(k)), relB(static_cast<size_t>(k));
 			std::vector<float> redA(static_cast<size_t>(k)), redB(static_cast<size_t>(k));
 			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				bank.view.paddedDims, metrics[m], 0.5f, k, selA.data(), relA.data(),
+				bank.view.paddedDims, metrics[m], 0.5f, k, nullptr, 0, selA.data(), relA.data(),
 				redA.data()) == Status::Ok);
 			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				bank.view.paddedDims, metrics[m], 0.5f, k, selB.data(), relB.data(),
+				bank.view.paddedDims, metrics[m], 0.5f, k, nullptr, 0, selB.data(), relB.data(),
 				redB.data()) == Status::Ok);
 			CHECK(selA == selB);
 			CHECK(relA == relB);
 			CHECK(redA == redB);
+		}
+
+		// --- Channel-weight axis (dim 4, D-INSP-55/57/58): non-default
+		// weights, sum(weight_s) != 1 -- cross-checked against
+		// RefSelectDiverseMMR's own weighted transform (Cosine's
+		// sum(weight_s) - x recovery; Dot's identity), not the pre-fold fixed-
+		// 1 recovery. A build using the fixed constant instead of
+		// sum(weight_s) fails this cell (mutation-provable, section 12 dim 7).
+		{
+			const int32_t pd2 = bank.view.paddedDims;
+			const int32_t half = (pd2 / 32) * 16; // first half, rounded to the 16-elem grid
+			const QuerySegment segs[2] = {{0, half, 1.6f}, {half, half, 0.4f}}; // sum = 2.0
+			std::vector<int32_t> sel(static_cast<size_t>(k), -1);
+			std::vector<float> rel(static_cast<size_t>(k), 0.0f);
+			std::vector<float> red(static_cast<size_t>(k), -1.0f);
+			const Status st = SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
+				pd2, metrics[m], 0.4f, k, segs, 2, sel.data(), rel.data(), red.data());
+
+			std::vector<int32_t> refSel(static_cast<size_t>(k), -1);
+			std::vector<float> refRel(static_cast<size_t>(k), 0.0f);
+			std::vector<float> refRed(static_cast<size_t>(k), -1.0f);
+			const Status refSt = RefSelectDiverseMMR(candidates.data(), queries.data(),
+				candidateCount, pd2, metrics[m], 0.4f, k, segs, 2, refSel.data(), refRel.data(),
+				refRed.data());
+			CHECK(st == refSt);
+			if (st == Status::Ok && refSt == Status::Ok)
+			{
+				for (int32_t i = 0; i < k; ++i)
+				{
+					CHECK_MSG(sel[static_cast<size_t>(i)] == refSel[static_cast<size_t>(i)],
+						"%s non-default channel weight: step %d op pos %d != ref pos %d",
+						names[m], i, sel[static_cast<size_t>(i)], refSel[static_cast<size_t>(i)]);
+					CHECK(red[static_cast<size_t>(i)] == refRed[static_cast<size_t>(i)]);
+				}
+
+				// --- Argmax invariance under a uniform weight rescale (dim 7):
+				// a term added to every candidate's score by the same
+				// per-step constant cannot move the argmax (section 6.2's
+				// cancellation proof) -- selection ORDER at weight vector W
+				// must equal weight vector 2W.
+				const QuerySegment segs2x[2] = {{0, half, 3.2f}, {half, half, 0.8f}}; // == 2*segs
+				std::vector<int32_t> sel2x(static_cast<size_t>(k), -1);
+				std::vector<float> rel2x(static_cast<size_t>(k), 0.0f);
+				std::vector<float> red2x(static_cast<size_t>(k), -1.0f);
+				CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount, pd2,
+					metrics[m], 0.4f, k, segs2x, 2, sel2x.data(), rel2x.data(), red2x.data()) ==
+					Status::Ok);
+				for (int32_t i = 0; i < k; ++i)
+				{
+					CHECK_MSG(sel[static_cast<size_t>(i)] == sel2x[static_cast<size_t>(i)],
+						"%s argmax invariance: step %d order at W (pos %d) != order at 2W (pos %d)",
+						names[m], i, sel[static_cast<size_t>(i)], sel2x[static_cast<size_t>(i)]);
+				}
+			}
 		}
 	}
 
@@ -20063,8 +20792,8 @@ static void TestDiversityMMR()
 		std::vector<float> rel(static_cast<size_t>(k), 0.0f);
 		std::vector<float> red(static_cast<size_t>(k), -1.0f);
 		CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-			bank.view.paddedDims, Metric::Dot, 1.0f, k, sel.data(), rel.data(), red.data()) ==
-			Status::Ok);
+			bank.view.paddedDims, Metric::Dot, 1.0f, k, nullptr, 0, sel.data(), rel.data(),
+			red.data()) == Status::Ok);
 		CHECK_MSG(sel[0] == 1, "tie-break: step 0 selected pos %d, expected pos 1 (index 2)",
 			sel[0]);
 		CHECK_MSG(sel[1] == 0, "tie-break: step 1 selected pos %d, expected pos 0 (index 7)",
@@ -20073,9 +20802,10 @@ static void TestDiversityMMR()
 			sel[2]);
 	}
 
-	// --- Status propagation: a Cosine candidate with a hand-built zero self-dot payload
-	// makes ScoreXdPair return ZeroNormQuery on the redundancy pass; SelectDiverseMMR
-	// propagates it rather than swallowing it or substituting a default.
+	// --- Status propagation, whole-row: a Cosine candidate with a hand-built zero
+	// self-dot payload makes ScoreXdPairSegmented's degenerate path return
+	// ZeroNormQuery on the redundancy pass; SelectDiverseMMR propagates it rather
+	// than swallowing it or substituting a default.
 	{
 		const int32_t paddedDims = 16;
 		std::vector<int8_t> liveImage(static_cast<size_t>(paddedDims), 0);
@@ -20090,10 +20820,78 @@ static void TestDiversityMMR()
 		std::vector<float> rel(2, 0.0f);
 		std::vector<float> red(2, -1.0f);
 		const Status st = SelectDiverseMMR(candidates.data(), queries.data(), 2, paddedDims,
-			Metric::Cosine, 0.5f, 2, sel.data(), rel.data(), red.data());
+			Metric::Cosine, 0.5f, 2, nullptr, 0, sel.data(), rel.data(), red.data());
 		CHECK_MSG(st == Status::ZeroNormQuery,
 			"zero-norm candidate: SelectDiverseMMR returned status %d, expected ZeroNormQuery",
 			static_cast<int>(st));
+	}
+
+	// --- Status propagation, weighted (dim 2/5, G-28): the aggregate weighted
+	// self-norm trigger reached through a real segment list, not the whole-row
+	// sqSum shortcut above.
+	{
+		const int32_t paddedDims = 32;
+		const QuerySegment segs[2] = {{0, 16, 1.0f}, {16, 16, 1.0f}};
+		std::vector<int8_t> zeroImage(static_cast<size_t>(paddedDims), 0);
+		std::vector<int8_t> liveImage(static_cast<size_t>(paddedDims), 0);
+		liveImage[0] = 5;
+		liveImage[20] = 3;
+		const XdQuery zeroQuery{zeroImage.data(), 1.0, 0};
+		const XdQuery liveQuery{liveImage.data(), 1.0,
+			detail::DotI8I8(liveImage.data(), liveImage.data(), paddedDims)};
+		const std::vector<XdQuery> queries = {liveQuery, zeroQuery};
+		const std::vector<Hit> candidates = {Hit{0, 2.0f}, Hit{1, 1.0f}};
+
+		std::vector<int32_t> sel(2, -1);
+		std::vector<float> rel(2, 0.0f);
+		std::vector<float> red(2, -1.0f);
+		const Status st = SelectDiverseMMR(candidates.data(), queries.data(), 2, paddedDims,
+			Metric::Cosine, 0.5f, 2, segs, 2, sel.data(), rel.data(), red.data());
+		CHECK_MSG(st == Status::ZeroNormQuery,
+			"weighted zero-norm candidate: SelectDiverseMMR returned status %d, expected "
+			"ZeroNormQuery", static_cast<int>(st));
+	}
+
+	// --- The crux (dim 7, D-INSP-47): the corrected Cosine redundancy term selects
+	// the diverse candidate over a near-duplicate at lambda=0.5, equal relevance --
+	// the shipped kernel (subtracting ScoreXdPair's raw 1-cos output unchanged)
+	// selects the duplicate instead (the polarity inversion Curie's oracle
+	// commission found executed against the pre-fix kernel). This is the cell whose
+	// absence let the pre-fix kernel ship.
+	{
+		const int32_t paddedDims = 16;
+		std::vector<int8_t> selectedImg(static_cast<size_t>(paddedDims), 4);
+		std::vector<int8_t> dupImg(static_cast<size_t>(paddedDims), 4);
+		dupImg[0] = 5; // near-identical direction to the selected row, not bit-identical
+		std::vector<int8_t> diverseImg(static_cast<size_t>(paddedDims));
+		for (int32_t i = 0; i < paddedDims; ++i)
+		{
+			diverseImg[static_cast<size_t>(i)] = (i % 2 == 0) ? int8_t(4) : int8_t(-4);
+		}
+		const XdQuery selectedQ{selectedImg.data(), 1.0,
+			detail::DotI8I8(selectedImg.data(), selectedImg.data(), paddedDims)};
+		const XdQuery dupQ{dupImg.data(), 1.0,
+			detail::DotI8I8(dupImg.data(), dupImg.data(), paddedDims)};
+		const XdQuery divQ{diverseImg.data(), 1.0,
+			detail::DotI8I8(diverseImg.data(), diverseImg.data(), paddedDims)};
+		std::vector<XdQuery> pool = {selectedQ, dupQ, divQ};
+
+		const std::vector<Hit> pooledCandidates = {
+			Hit{2, 1.0f}, // pos 0: seed, highest relevance -- always picked first
+			Hit{0, 0.5f}, // pos 1: near-duplicate of pos 0, equal relevance to pos 2
+			Hit{1, 0.5f}, // pos 2: diverse from pos 0, equal relevance to pos 1
+		};
+		std::vector<int32_t> sel(2, -1);
+		std::vector<float> rel(2, 0.0f);
+		std::vector<float> red(2, -1.0f);
+		CHECK(SelectDiverseMMR(pooledCandidates.data(), pool.data(), 3, paddedDims, Metric::Cosine,
+			0.5f, 2, nullptr, 0, sel.data(), rel.data(), red.data()) == Status::Ok);
+		CHECK_MSG(sel[0] == 0,
+			"crux fixture: step 0 must pick the highest-relevance seed, got pos %d", sel[0]);
+		CHECK(red[0] == 0.0f);
+		CHECK_MSG(sel[1] == 2,
+			"crux fixture: step 1 must pick the DIVERSE candidate (pos 2), not the near-duplicate "
+			"(pos 1) -- got pos %d (this is the D-INSP-47 polarity-inversion cell)", sel[1]);
 	}
 }
 
@@ -20118,9 +20916,10 @@ static void TestAllocFlatDiversity()
 	std::vector<int32_t> sel(static_cast<size_t>(k));
 	std::vector<float> rel(static_cast<size_t>(k));
 	std::vector<float> red(static_cast<size_t>(k));
+	const QuerySegment segs[1] = {{0, bank.view.paddedDims, 1.0f}};
 
 	CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-		bank.view.paddedDims, Metric::Dot, 0.5f, k, sel.data(), rel.data(), red.data()) ==
+		bank.view.paddedDims, Metric::Dot, 0.5f, k, segs, 1, sel.data(), rel.data(), red.data()) ==
 		Status::Ok);
 
 	const uint64_t allocsBefore = AllocationCount();
@@ -20129,8 +20928,8 @@ static void TestAllocFlatDiversity()
 		for (int32_t i = 0; i < 10; ++i)
 		{
 			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				bank.view.paddedDims, Metric::Dot, 0.5f, k, sel.data(), rel.data(), red.data()) ==
-				Status::Ok);
+				bank.view.paddedDims, Metric::Dot, 0.5f, k, segs, 1, sel.data(), rel.data(),
+				red.data()) == Status::Ok);
 		}
 		CHECK_MSG(rawTracking.Count() == 0,
 			"SelectDiverseMMR allocated %llu time(s) outside the seam",
@@ -20188,6 +20987,7 @@ int main()
 	TestAllocFlatWorkspaceReserveIndexScratch();
 	TestAllocFlatAnalyticsWholeVector();
 	TestAllocFlatAnalyticsChannel();
+	TestAllocFlatAnalyticsSegmentedPair();
 	TestAllocFlatProjectionReport();
 	TestAllocFlatDiversity();
 	TestAllocFlatCompose();
@@ -20316,7 +21116,20 @@ int main()
 	TestEmptyCosineChannelBankValidates();
 	TestPeekScratchArchive();
 
-	// V3.4: diversity -- greedy MMR selection (Gate 0b, drift-and-diversity plan §6).
+	// V3.4: ScoreXdPairSegmented -- new pairwise segmented weighted cross-device
+	// score (Gate 0b, drift-and-diversity plan §6.2).
+	TestScoreXdPairSegmentedDegenerateIdentity();
+	TestScoreXdPairSegmentedDeterminism();
+	TestScoreXdPairSegmentedPayloadLawSymmetry();
+	TestScoreXdPairSegmentedLocalValidator();
+	TestScoreXdPairSegmentedValidatorAgreement();
+	TestScoreXdPairSegmentedCosineZeroNormBoundary();
+	TestScoreXdPairSegmentedPerMetricCombine();
+	TestScoreXdPairSegmentedSegmentCountExtremes();
+	TestScoreXdPairSegmentedCosineHomogeneity();
+
+	// V3.4: diversity -- greedy MMR selection, rebuilt redundancy term (Gate 0b,
+	// drift-and-diversity plan §6).
 	TestDiversityMMR();
 
 	// Coverage audit §7 -- the structural registry guard. Runs last so every
