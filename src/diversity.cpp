@@ -26,18 +26,6 @@ inline float XdFloorDiversityLocal(double score)
 	return static_cast<float>(score);
 }
 
-// Metric::L2's shared relevance/redundancy transform (drift-and-diversity plan section
-// 6.2): `f(x) = 1 - sqrt(x)/L`, strictly decreasing for every x >= 0, L > 0 -- reverses raw
-// squared-distance order into a similarity-shaped scale. Retained for DISPLAY values only
-// (outRelevance/outRedundancy, computed once per step for the winning candidate, below).
-// `f` is exact over the reals but only non-strictly decreasing once its output is rounded
-// to float32, so the argmax comparison below never materializes this transform -- see
-// L2RankingRatio.
-inline double L2RelevanceShapeTransform(double raw, double l2Scale)
-{
-	return 1.0 - std::sqrt(raw) / l2Scale;
-}
-
 // The fourth-adversarial-strike remedy (drift-and-diversity plan section 6.2, construction
 // B, D-SLM1778). `u = sqrt(x)/L`, the pre-transform ratio `f(x) = 1 - u` is built from.
 // Comparing `u` directly (double, never rounded to float32) removes the argmax's
@@ -94,10 +82,12 @@ Status SelectDiverseMMR(
 		double bestURel = 0.0;
 		double bestMeanURed = 0.0;
 
-		// Metric::Dot/Metric::Cosine path: unchanged from the shipped kernel. Neither
-		// metric applies a transform to relevance (no float32 compression risk exists on
-		// either -- confirmed, fourth adversarial strike, Control A), so the comparison
-		// stays exactly as shipped.
+		// Metric::Dot/Metric::Cosine path: the COMPARISON is unchanged from the shipped
+		// kernel. Neither metric applies a transform to relevance (no float32 compression
+		// risk exists on either -- confirmed, fourth adversarial strike, Control A), so
+		// score/relevance/redundancy are computed exactly as shipped. The DISPLAY value is
+		// not unchanged: outRelevance is now floored uniformly for every metric (D-SLM1779,
+		// below), where the shipped kernel assigned bestRelevance raw.
 		float bestScore = 0.0f;
 		float bestRelevance = 0.0f;
 		float bestRedundancy = 0.0f;
