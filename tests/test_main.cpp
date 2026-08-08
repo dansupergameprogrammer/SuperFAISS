@@ -20867,9 +20867,21 @@ static void TestAllocFlatAnalyticsSegmentedPair()
 // it, and not sharing the per-metric transform code with src/diversity.cpp.
 // `l2Scale` is `L`, read only when `metric == Metric::L2` -- the caller-
 // computed, caller-cached bank-intrinsic scale (section 6.2's `l2Scale`
-// parameter), applied via `f(x) = 1 - sqrt(x)/L` to BOTH the relevance and
-// redundancy operands, matching the real function's own two call sites for
-// that transform.
+// parameter). For Dot/Cosine, `relevance`/`redundancy` are the raw
+// (untransformed, or Cosine-recovered) operands, unchanged from before this
+// fold. For L2 (T-1828, D-SLM1787/1788): `f(x) = 1 - sqrt(x)/L` is
+// materialized in `long double`, not `float32`, and the full spec formula
+// `lambda * relevance - (1 - lambda) * redundancy` is evaluated at that same
+// precision -- an INDEPENDENT construction from src/diversity.cpp's own
+// ranking key (which never materializes `1 - u` and instead compares the
+// pre-transform ratio directly, dropping a shared additive constant). Two
+// distinct constructions reaching the same real-valued answer is the
+// cross-check; `long double`'s mantissa (>= double's 52 bits on every
+// toolchain in this suite's matrix, equal to double's only on MSVC) keeps
+// the ~1e-8-scale `u` separations the fourth adversarial strike measured
+// representable after the subtraction, unlike this oracle's own pre-fold
+// `float32` materialization, which collided on exactly that geometry
+// (D-SLM1788).
 static Status RefSelectDiverseMMR(
 	const Hit* candidates, const XdQuery* candidateQueries, int32_t candidateCount,
 	int32_t paddedDims, Metric metric, float lambda, int32_t k,
@@ -20881,9 +20893,60 @@ static Status RefSelectDiverseMMR(
 	for (int32_t step = 0; step < k; ++step)
 	{
 		int32_t bestPos = -1;
-		float bestScore = 0.0f;
 		float bestRelevance = 0.0f;
 		float bestRedundancy = 0.0f;
+
+		if (metric == Metric::L2)
+		{
+			const long double l2ScaleL = static_cast<long double>(l2Scale);
+			const long double lambdaL = static_cast<long double>(lambda);
+			long double bestScoreL = 0.0L;
+			for (int32_t pos = 0; pos < candidateCount; ++pos)
+			{
+				if (selected[static_cast<size_t>(pos)])
+				{
+					continue;
+				}
+
+				const long double relevanceL = 1.0L -
+					std::sqrt(static_cast<long double>(candidates[pos].score)) / l2ScaleL;
+
+				long double acc = 0.0L;
+				for (int32_t s = 0; s < step; ++s)
+				{
+					float raw = 0.0f;
+					const Status st = ScoreXdPairSegmented(candidateQueries[pos],
+						candidateQueries[outSelectedIndices[s]], paddedDims, metric, segments,
+						segmentCount, &raw);
+					if (st != Status::Ok)
+					{
+						return st;
+					}
+					acc += 1.0L - std::sqrt(static_cast<long double>(raw)) / l2ScaleL;
+				}
+				const long double redundancyL =
+					(step > 0) ? (acc / static_cast<long double>(step)) : 0.0L;
+				const long double scoreL =
+					lambdaL * relevanceL - (1.0L - lambdaL) * redundancyL;
+
+				if (bestPos == -1 || scoreL > bestScoreL ||
+					(scoreL == bestScoreL && candidates[pos].index < candidates[bestPos].index))
+				{
+					bestPos = pos;
+					bestScoreL = scoreL;
+					bestRelevance = static_cast<float>(relevanceL);
+					const double redD = static_cast<double>(redundancyL);
+					bestRedundancy = (redD < lim && redD > -lim) ? 0.0f : static_cast<float>(redD);
+				}
+			}
+			outSelectedIndices[step] = bestPos;
+			selected[static_cast<size_t>(bestPos)] = true;
+			outRelevance[step] = bestRelevance;
+			outRedundancy[step] = bestRedundancy;
+			continue;
+		}
+
+		float bestScore = 0.0f;
 		for (int32_t pos = 0; pos < candidateCount; ++pos)
 		{
 			if (selected[static_cast<size_t>(pos)])
@@ -20891,15 +20954,8 @@ static Status RefSelectDiverseMMR(
 				continue;
 			}
 
-			// Relevance: identity for Dot/Cosine; f(x) = 1 - sqrt(x)/L for L2
-			// (section 6.2's L2 bullet, applied to `candidates[pos].score`).
-			float relevance = candidates[pos].score;
-			if (metric == Metric::L2)
-			{
-				relevance = static_cast<float>(1.0 -
-					std::sqrt(static_cast<double>(candidates[pos].score)) /
-						static_cast<double>(l2Scale));
-			}
+			// Relevance: identity for Dot/Cosine.
+			const float relevance = candidates[pos].score;
 
 			double acc = 0.0;
 			for (int32_t s = 0; s < step; ++s)
@@ -20913,15 +20969,13 @@ static Status RefSelectDiverseMMR(
 					return st;
 				}
 				// The per-metric redundancy transform (section 6.2): Dot is
-				// the identity; Cosine recovers sum(weight_s) - raw; L2 is
-				// the identical f(x) = 1 - sqrt(x)/L applied to the
-				// candidate-to-selected pairwise distance.
+				// the identity; Cosine recovers sum(weight_s) - raw.
 				double transformed = 0.0;
 				if (metric == Metric::Dot)
 				{
 					transformed = static_cast<double>(raw);
 				}
-				else if (metric == Metric::Cosine)
+				else // Metric::Cosine
 				{
 					double sumWeight = 0.0;
 					if (segmentCount == 0 || segments == nullptr)
@@ -20936,11 +20990,6 @@ static Status RefSelectDiverseMMR(
 						}
 					}
 					transformed = sumWeight - static_cast<double>(raw);
-				}
-				else // Metric::L2
-				{
-					transformed = 1.0 -
-						std::sqrt(static_cast<double>(raw)) / static_cast<double>(l2Scale);
 				}
 				acc += transformed;
 			}
@@ -21217,6 +21266,73 @@ static void TestDiversityMMR()
 						names[m], i, sel[static_cast<size_t>(i)], sel2x[static_cast<size_t>(i)]);
 				}
 			}
+		}
+	}
+
+	// --- Compression-region L2 cross-check (T-1828, D-SLM1787/1788): four candidates
+	// whose pre-transform ratios sit 4e-8 apart at u ~ 0.1 -- the fourth adversarial
+	// strike's own onset measurement (Claude/Loki/t1827-probe: resolution loss onsets at
+	// u = 0.706631 and grows below it) -- with Hit.index DESCENDING so a float32(1-u)
+	// collision's ascending-index tie-break would invert the true winner. `sel[0] == 0`
+	// is the HAND-DERIVED ground truth, independent of either implementation below: raw
+	// distance strictly increases with pool position by construction, so topk.h's own
+	// Better(..., Metric::L2) order (ascending raw distance) selects pos 0 first at every
+	// lambda > 0. This is the cell the pre-b74d182 `Metric::L2` construction cannot pass:
+	// reverting src/diversity.cpp's ranking key to that construction (the mutation
+	// D-SLM1787 records as unguarded before this fold) resolves the pos-0/pos-1
+	// `float32(1-u)` collision on ascending Hit.index and selects pos 1 (index 20) first
+	// instead of pos 0 (index 30).
+	{
+		const float l2Scale = 1.0f;
+		const int32_t candidateCount = 4;
+		const int32_t k = 4;
+		const double uBase = 0.1;
+		const double uStep = 4e-8;
+		const int32_t indices[4] = {30, 20, 10, 0}; // descending -- inverts the tie-break
+		std::vector<Hit> candidates(static_cast<size_t>(candidateCount));
+		for (int32_t i = 0; i < candidateCount; ++i)
+		{
+			const double u = uBase + uStep * static_cast<double>(i);
+			candidates[static_cast<size_t>(i)] = Hit{indices[i], static_cast<float>(u * u)};
+		}
+
+		Rng rng(0xC0117E55ull); // "compression"
+		const int32_t dims = 16, bankCount = 8;
+		TestBank bank(rng, bankCount, dims, Quantization::Int8, Metric::L2);
+		std::vector<std::vector<int8_t>> images;
+		std::vector<XdQuery> queries;
+		BuildRowQueries(bank.view, candidateCount, images, queries);
+
+		const float lambdasCompression[3] = {1.0f, 0.7f, 0.3f};
+		for (int32_t li = 0; li < 3; ++li)
+		{
+			const float lambda = lambdasCompression[li];
+			std::vector<int32_t> sel(static_cast<size_t>(k), -1);
+			std::vector<float> rel(static_cast<size_t>(k), 0.0f);
+			std::vector<float> red(static_cast<size_t>(k), -1.0f);
+			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
+				bank.view.paddedDims, Metric::L2, lambda, k, nullptr, 0, l2Scale, sel.data(),
+				rel.data(), red.data()) == Status::Ok);
+
+			std::vector<int32_t> refSel(static_cast<size_t>(k), -1);
+			std::vector<float> refRel(static_cast<size_t>(k), 0.0f);
+			std::vector<float> refRed(static_cast<size_t>(k), -1.0f);
+			CHECK(RefSelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
+				bank.view.paddedDims, Metric::L2, lambda, k, nullptr, 0, l2Scale, refSel.data(),
+				refRel.data(), refRed.data()) == Status::Ok);
+
+			for (int32_t i = 0; i < k; ++i)
+			{
+				CHECK_MSG(sel[static_cast<size_t>(i)] == refSel[static_cast<size_t>(i)],
+					"L2 compression-region lambda=%.2f: step %d op pos %d != ref pos %d",
+					static_cast<double>(lambda), i, sel[static_cast<size_t>(i)],
+					refSel[static_cast<size_t>(i)]);
+			}
+			CHECK_MSG(sel[0] == 0,
+				"L2 compression-region lambda=%.2f: step 0 selected pos %d, expected pos 0 "
+				"(ascending raw distance / topk.h Better order -- a float32(1-u) collision "
+				"would select pos 1 via the ascending-index tie-break)",
+				static_cast<double>(lambda), sel[0]);
 		}
 	}
 
