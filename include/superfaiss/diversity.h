@@ -93,8 +93,10 @@ namespace superfaiss
 // step for the step's winner only, after the argmax has resolved -- for L2, `f(x) = 1 -
 // sqrt(x) / l2Scale` applied to the winner's own `u_rel`/`mean_u_red` (the same pre-transform
 // ratios the comparison used, but not the quantity the L2 comparison itself compared); for
-// Dot and Cosine, the raw comparison operands unchanged. In selection order -- the values the
-// caller renders beside each result row.
+// Dot and Cosine, the raw comparison operands. Both display outputs are floored uniformly for
+// every metric (D-SLM1779): `float32`, with `|value| < FLT_MIN` flushed to exactly `0.0f`, the
+// codebase's cross-device subnormal convention. In selection order -- the values the caller
+// renders beside each result row.
 //
 // Determinism: reuses ScoreXdPairSegmented's already-proven cross-device-exact scoring; the
 // only new nondeterminism surface is the argmax tie-break, closed by the pinned

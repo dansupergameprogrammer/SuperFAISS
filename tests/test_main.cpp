@@ -21135,8 +21135,9 @@ static void TestDiversityMMR()
 
 		// --- lambda < 1, channelless: cross-checked against RefSelectDiverseMMR's
 		// corrected redundancy transform, and the first pick is still the
-		// most-relevant candidate regardless of lambda (the spec's
-		// positive-scalar-multiple claim).
+		// most-relevant candidate regardless of lambda (the header's step-0
+		// claim: a positive scalar multiple of relevance for Dot/Cosine, an
+		// affine function of relevance for L2 -- same resulting order).
 		const float lambdas[3] = {0.0f, 0.3f, 0.7f};
 		for (int32_t li = 0; li < 3; ++li)
 		{
@@ -21513,6 +21514,31 @@ static void TestDiversityMMR()
 			"near-duplicate (pos 1, small raw distance -> high transformed redundancy) -- got "
 			"pos %d (this is section 12 dim 7's redundancy-side half-applied-transform mutant)",
 			sel[1]);
+	}
+
+	// --- Subnormal display floor, Metric::Dot (N-1, D-SLM1798): the header states both
+	// display outputs are floored uniformly for every metric -- float32, with
+	// |value| < FLT_MIN flushed to exactly 0.0f (D-SLM1779). Metric::Dot's relevance
+	// display is candidates[pos].score passed straight through XdFloorDiversityLocal
+	// (src/diversity.cpp), so a subnormal Hit.score pins that promise directly: an
+	// implementation that skips the floor on this display path fails this cell.
+	{
+		const int32_t paddedDims = 16;
+		std::vector<int8_t> image(static_cast<size_t>(paddedDims), 1);
+		const XdQuery query{
+			image.data(), 1.0, detail::DotI8I8(image.data(), image.data(), paddedDims)};
+		const std::vector<XdQuery> pool = {query};
+		const std::vector<Hit> candidates = {Hit{0, std::numeric_limits<float>::denorm_min()}};
+
+		std::vector<int32_t> sel(1, -1);
+		std::vector<float> rel(1, -1.0f);
+		std::vector<float> red(1, -1.0f);
+		CHECK(SelectDiverseMMR(candidates.data(), pool.data(), 1, paddedDims, Metric::Dot, 1.0f, 1,
+			nullptr, 0, 0.0f, sel.data(), rel.data(), red.data()) == Status::Ok);
+		CHECK_MSG(rel[0] == 0.0f,
+			"Dot subnormal display floor: relevance %.9g != 0 (Hit.score %.9g is subnormal and "
+			"must flush to exactly 0.0f per the header's D-SLM1779 floor promise)",
+			static_cast<double>(rel[0]), static_cast<double>(candidates[0].score));
 	}
 }
 

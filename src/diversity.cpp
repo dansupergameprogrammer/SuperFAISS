@@ -110,6 +110,15 @@ Status SelectDiverseMMR(
 
 			const int32_t index = candidates[pos].index;
 
+			// The fork below gives the deferred D-SLM1780 `bestPos == -1` guard two landing
+			// sites in this file, should it ever land: the L2 branch's
+			// `candidateQueries[outSelectedIndices[s]]` dereference just below, and the
+			// Dot/Cosine branch's equivalent further down. The T-1828 oracle fold (103f10f)
+			// forked `RefSelectDiverseMMR`'s per-step body the same way, so the guard has two
+			// more landing sites in `tests/test_main.cpp`
+			// (Claude/Poirot/103f10f-gate0b-remedy-confirmation.md N-3, D-SLM1800). D-SLM1780
+			// remains gated on establishing reachability; this note records where the guard
+			// lands once it is.
 			if (metric == Metric::L2)
 			{
 				// The pre-transform ratio, relevance's operand.
