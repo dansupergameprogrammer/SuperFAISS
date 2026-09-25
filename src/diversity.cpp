@@ -37,9 +37,14 @@ inline float XdFloorDiversityLocal(double score)
 // COMPARISON to double while still forming `1 - u` (the rejected alternative, plan section
 // 6.2) is the identical representational compression at a smaller floor, not its removal;
 // this function is never composed with a `1 -` before the argmax uses it.
+//
+// `raw` is clamped at 0 before the sqrt: the expanded L2 pair distance can round a hair
+// below zero for near-identical payloads (kernels.cpp documents the same epilogue
+// behaviour), and sqrt of a negative is NaN under Status::Ok, which would then make the
+// argmax depend on pool order. A true distance is never negative, so 0 is the exact value.
 inline double L2RankingRatio(double raw, double l2Scale)
 {
-	return std::sqrt(raw) / l2Scale;
+	return (raw > 0.0 ? std::sqrt(raw) : 0.0) / l2Scale;
 }
 
 } // namespace
@@ -98,7 +103,7 @@ Status SelectDiverseMMR(
 		// (no float32 compression risk exists on either -- confirmed, fourth adversarial
 		// strike, Control A). The DISPLAY value is floored uniformly for every metric
 		// (D-SLM1779, below).
-		float bestScore = 0.0f;
+		double bestScore = 0.0;
 		float bestRelevance = 0.0f;
 		float bestRedundancy = 0.0f;
 
@@ -209,7 +214,10 @@ Status SelectDiverseMMR(
 				? XdFloorDiversityLocal(redundancyScratch[pos] / static_cast<double>(step))
 				: 0.0f;
 
-			const float score = lambda * relevance - (1.0f - lambda) * redundancy;
+			// Combined in double: a float32 product can round two candidates one ulp apart to
+			// the same score, and the tie-break would then override relevance.
+			const double score = lambdaD * static_cast<double>(relevance)
+				- (1.0 - lambdaD) * static_cast<double>(redundancy);
 
 			// argmax, ties broken on ascending candidate row index (topk.h's Better()
 			// convention), never on pool position.

@@ -14,7 +14,7 @@ by feature tier (minor = new capability, patch = fix), not strict SemVer of a pu
 ### Added
 - **`SelectDiverseMMR`** (`diversity.h`) — greedy Maximal Marginal Relevance selection over an
   already-retrieved candidate pool. Each pick maximizes `lambda · relevance − (1 − lambda) ·
-  redundancy`, where redundancy is the mean distance to the members already picked; `lambda = 1`
+  redundancy`, where redundancy is the mean similarity to the members already picked; `lambda = 1`
   is plain relevance order. Redundancy weighs channels with the query's own segment list, ties
   break on ascending bank row index, and on `Metric::L2` the comparison ranks on an unrounded
   double key, so a `float32` rounding of the display value can never reorder two candidates.

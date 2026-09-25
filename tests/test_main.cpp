@@ -21560,6 +21560,122 @@ static void TestDiversityMMR()
 // SelectDiverseMMR reuses ScoreXdPair over caller-provided output buffers with no
 // internal collection of its own -- the same allocation-flatness contract this file
 // already proves for every other analytics.h CrossDevice operator it composes.
+// --- 3.4 release review: two kernel defects found after Gate 0b closed.
+// (1) Metric::L2: the expanded pair distance can round a hair below zero for a row and its
+// re-lifted twin, and the relevance can be negative the same way; sqrt of either was NaN
+// under Status::Ok and made the selection depend on pool order. The ranking ratio now
+// clamps at zero. (2) Dot/Cosine: the combined score was formed in float, so two
+// candidates one ulp apart in relevance tied and the tie-break (lower row index) took the
+// less relevant one first. The score is now formed in double.
+static void TestDiversityMMRReleaseReviewFixes()
+{
+	std::printf("diversity: L2 negative-raw clamp and double-precision combine (3.4 release review)\n");
+	const int32_t dims = 64, pd = 64;
+
+	// (1a) Find a stored row whose re-lifted twin scores a negative L2 raw distance.
+	Rng rng(0x5F34A11Cull);
+	std::vector<float> row(static_cast<size_t>(dims)), deq(static_cast<size_t>(pd));
+	std::vector<int8_t> imgA(static_cast<size_t>(pd)), imgA2(static_cast<size_t>(pd));
+	float storedScale = 0.0f;
+	double liftScale = 0.0;
+	int64_t liftSq = 0;
+	bool found = false;
+	for (int32_t t = 0; t < 20000 && !found; ++t)
+	{
+		for (float& v : row) v = rng.NextFloat();
+		QuantizeRowsInt8(row.data(), 1, dims, pd, imgA.data(), &storedScale);
+		BankView bv;
+		bv.rows = imgA.data(); bv.scales = &storedScale; bv.count = 1; bv.dims = dims;
+		bv.paddedDims = pd; bv.quant = Quantization::Int8; bv.metric = Metric::L2;
+		DequantizeRowAsQuery(bv, 0, deq.data());
+		QuantizeQueryXd(deq.data(), pd, imgA2.data(), &liftScale, &liftSq);
+		int64_t sqA = 0;
+		for (int32_t d = 0; d < pd; ++d) sqA += static_cast<int64_t>(imgA[d]) * imgA[d];
+		const XdQuery a{imgA.data(), static_cast<double>(storedScale), sqA};
+		const XdQuery a2{imgA2.data(), liftScale, liftSq};
+		float raw = 0.0f;
+		if (ScoreXdPairSegmented(a, a2, pd, Metric::L2, nullptr, 0, &raw) == Status::Ok && raw < 0.0f)
+		{
+			found = true;
+		}
+	}
+	CHECK_MSG(found, "no negative L2 raw pair found in 20000 draws; the construction no longer reaches the case");
+	if (found)
+	{
+		int64_t sqA = 0;
+		for (int32_t d = 0; d < pd; ++d) sqA += static_cast<int64_t>(imgA[d]) * imgA[d];
+		std::vector<int8_t> imgB(static_cast<size_t>(pd));
+		int64_t sqB = 0;
+		for (int32_t d = 0; d < pd; ++d)
+		{
+			imgB[static_cast<size_t>(d)] = static_cast<int8_t>(static_cast<int32_t>(rng.Next() % 255u) - 127);
+			sqB += static_cast<int64_t>(imgB[d]) * imgB[d];
+		}
+		const XdQuery A{imgA.data(), static_cast<double>(storedScale), sqA};
+		const XdQuery A2{imgA2.data(), liftScale, liftSq};
+		const XdQuery B{imgB.data(), static_cast<double>(storedScale), sqB};
+		// (1b) Same three candidates in two pool orders. A is most relevant; A2 is A's twin;
+		// B is unrelated. The selection (by bank row) must not depend on pool order, and no
+		// display value may be NaN. A carries a negative relevance, as a query can return.
+		int32_t firstOrder[3] = {-1, -1, -1};
+		for (int32_t order = 0; order < 2; ++order)
+		{
+			Hit h[3];
+			XdQuery q[3];
+			h[0] = Hit{10, -7.0e-15f}; q[0] = A;
+			if (order == 0) { h[1] = Hit{20, 0.02f}; q[1] = A2; h[2] = Hit{30, 0.50f}; q[2] = B; }
+			else { h[1] = Hit{30, 0.50f}; q[1] = B; h[2] = Hit{20, 0.02f}; q[2] = A2; }
+			int32_t sel[3] = {-1, -1, -1};
+			float rel[3] = {0, 0, 0}, red[3] = {0, 0, 0};
+			const Status st = SelectDiverseMMR(h, q, 3, pd, Metric::L2, 0.5f, 3, nullptr, 0, 3.0f,
+				MmrScratch(3), sel, rel, red);
+			CHECK(st == Status::Ok);
+			for (int32_t i = 0; i < 3; ++i)
+			{
+				CHECK_MSG(!std::isnan(rel[i]) && !std::isnan(red[i]),
+					"order %d pick %d: NaN display value (rel %g, red %g)", order, i,
+					static_cast<double>(rel[i]), static_cast<double>(red[i]));
+				const int32_t bankRow = (sel[i] >= 0 && sel[i] < 3) ? h[sel[i]].index : -1;
+				if (order == 0) firstOrder[i] = bankRow;
+				else CHECK_MSG(bankRow == firstOrder[i], "pick %d: row %d in one pool order, %d in the other",
+					i, firstOrder[i], bankRow);
+			}
+		}
+	}
+
+	// (2) Dot and Cosine: relevance one float ulp apart, the less relevant candidate on the
+	// lower row index. The first pick must be the more relevant one at every lambda > 0.
+	int8_t imgP[16], imgQ[16];
+	int64_t sqP = 0, sqQ = 0;
+	for (int32_t i = 0; i < 16; ++i)
+	{
+		imgP[i] = static_cast<int8_t>(10 + i);
+		imgQ[i] = static_cast<int8_t>(-5 - i);
+		sqP += static_cast<int64_t>(imgP[i]) * imgP[i];
+		sqQ += static_cast<int64_t>(imgQ[i]) * imgQ[i];
+	}
+	int32_t wrong = 0, trials = 0;
+	const Metric metrics[2] = {Metric::Dot, Metric::Cosine};
+	for (Metric m : metrics)
+	{
+		for (int32_t t = 0; t < 20000; ++t)
+		{
+			const float lambda = 0.05f + 0.9f * (0.5f + 0.5f * rng.NextFloat());
+			const float rHi = 0.1f + 0.89f * (0.5f + 0.5f * rng.NextFloat());
+			const float rLo = std::nextafter(rHi, 0.0f);
+			Hit h[2] = {Hit{5, rHi}, Hit{3, rLo}};
+			XdQuery q[2] = {XdQuery{imgP, 0.01, sqP}, XdQuery{imgQ, 0.01, sqQ}};
+			int32_t sel[1] = {-1};
+			float rel[1], red[1];
+			CHECK(SelectDiverseMMR(h, q, 2, 16, m, lambda, 1, nullptr, 0, 0.0f, MmrScratch(2),
+				sel, rel, red) == Status::Ok);
+			++trials;
+			if (sel[0] != 0) ++wrong;
+		}
+	}
+	CHECK_MSG(wrong == 0, "first pick was not the most relevant in %d of %d one-ulp trials", wrong, trials);
+}
+
 static void TestAllocFlatDiversity()
 {
 	Rng rng(0x71EA);
@@ -21793,6 +21909,7 @@ int main()
 	// V3.4: diversity -- greedy MMR selection, rebuilt redundancy term (Gate 0b,
 	// drift-and-diversity plan §6).
 	TestDiversityMMR();
+	TestDiversityMMRReleaseReviewFixes();
 
 	// Coverage audit §7 -- the structural registry guard. Runs last so every
 	// cell it references above has already executed at least once.

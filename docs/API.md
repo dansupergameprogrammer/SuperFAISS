@@ -594,9 +594,9 @@ Status SelectDiverseMMR(
 | `outRelevance` / `outRedundancy` | per-pick display values in selection order, `float32`, subnormals flushed to `0` |
 
 Each step maximizes `lambda · relevance − (1 − lambda) · redundancy`, where redundancy is the mean
-distance-sense score against the members already picked (double accumulation in selection order,
-one divide — `Reduce::Mean`'s convention) and is exactly `0` at the first step. Dot uses the score
-as-is; Cosine recovers similarity as `Σ weight_s − score`. **L2 ranks on the pre-transform ratio
+similarity to the members already picked (double accumulation in selection order,
+one divide — `Reduce::Mean`'s convention) and is exactly `0` at the first step. The combination is
+formed in double. Dot uses the pair score as-is; Cosine recovers similarity as `Σ weight_s − score`. **L2 ranks on the pre-transform ratio
 `sqrt(distance) / l2Scale` in double** and never compares the rounded display transform
 `1 − sqrt(x) / l2Scale`, which is not strictly monotone once rounded to `float32`. Ties break on
 ascending bank row index, `topk.h`'s convention — never on pool position. Each candidate keeps a running
