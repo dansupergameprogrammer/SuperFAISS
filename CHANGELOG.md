@@ -9,6 +9,21 @@ per entry. Reconstructed from git history 2026-07-12.
 The format follows [Keep a Changelog](https://keepachangelog.com); this project versions
 by feature tier (minor = new capability, patch = fix), not strict SemVer of a public ABI.
 
+## [3.4.0] — unreleased
+
+### Added
+- **`SelectDiverseMMR`** (`diversity.h`) — greedy Maximal Marginal Relevance selection over an
+  already-retrieved candidate pool. Each pick maximizes `lambda · relevance − (1 − lambda) ·
+  redundancy`, where redundancy is the mean distance to the members already picked; `lambda = 1`
+  is plain relevance order. Redundancy weighs channels with the query's own segment list, ties
+  break on ascending bank row index, and on `Metric::L2` the comparison ranks on an unrounded
+  double key, so a `float32` rounding of the display value can never reorder two candidates.
+  Cross-device deterministic; no allocation.
+- **`ScoreXdPairSegmented`** (`analytics.h`) — `ScoreXdPair` weighted over a `QuerySegment` list,
+  the pairwise counterpart of the segmented scan. With no segments it is bit-identical to
+  `ScoreXdPair`. It refuses a negative segment weight, and on Cosine it refuses only an operand
+  whose aggregate weighted self-norm is zero.
+
 ## [3.3.0] — 2026-07-21
 
 ### Added

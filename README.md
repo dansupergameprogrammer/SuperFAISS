@@ -227,6 +227,12 @@ suite enforces that SIMD and mirror results are bit-identical on a device.
   frame, say) uses `archiveBytes` to locate and validate that trailer *before* committing the
   load, rather than discovering a broken trailer with the rows already replaced. Reading the
   header twice is free; unwinding a load is not. [API.md](docs/API.md).
+- **Diversity selection (v3.4).** `SelectDiverseMMR` re-ranks an over-fetched result list by
+  Maximal Marginal Relevance, so the top results are relevant *and* unlike each other: "ten
+  places the player might mean, not ten views of the same one." One `lambda` trades relevance
+  against spread, and `lambda = 1` is exactly relevance order. Redundancy is scored with the
+  new `ScoreXdPairSegmented`, so it weighs channels the way the query did. Cross-device
+  deterministic like the query path, with ties pinned to row index. [API.md](docs/API.md).
 
 ## What it deliberately is not
 
