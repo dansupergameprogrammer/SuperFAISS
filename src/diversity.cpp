@@ -48,6 +48,7 @@ Status SelectDiverseMMR(
 	const Hit* candidates, const XdQuery* candidateQueries, int32_t candidateCount,
 	int32_t paddedDims, Metric metric, float lambda, int32_t k,
 	const QuerySegment* segments, int32_t segmentCount, float l2Scale,
+	double* redundancyScratch,
 	int32_t* outSelectedIndices, float* outRelevance, float* outRedundancy)
 {
 	// Metric::Cosine's own recovery constant (section 6.2, D-INSP-57): the segment list's
@@ -68,6 +69,17 @@ Status SelectDiverseMMR(
 	const double l2ScaleD = static_cast<double>(l2Scale);
 	const double lambdaD = static_cast<double>(lambda);
 
+	// The running redundancy sum per candidate (header: redundancyScratch). Each step adds
+	// exactly one term per unselected candidate -- its transformed pairwise score against the
+	// member selected at the previous step -- so after `step` steps redundancyScratch[pos]
+	// holds the sum over already-selected members in selection order: the same double
+	// additions, in the same order, starting from the same 0.0, that a full recomputation
+	// would perform. The mean is that sum divided by `step`, as before.
+	for (int32_t pos = 0; pos < candidateCount; ++pos)
+	{
+		redundancyScratch[pos] = 0.0;
+	}
+
 	for (int32_t step = 0; step < k; ++step)
 	{
 		int32_t bestPos = -1;
@@ -82,15 +94,17 @@ Status SelectDiverseMMR(
 		double bestURel = 0.0;
 		double bestMeanURed = 0.0;
 
-		// Metric::Dot/Metric::Cosine path: the COMPARISON is unchanged from the shipped
-		// kernel. Neither metric applies a transform to relevance (no float32 compression
-		// risk exists on either -- confirmed, fourth adversarial strike, Control A), so
-		// score/relevance/redundancy are computed exactly as shipped. The DISPLAY value is
-		// not unchanged: outRelevance is now floored uniformly for every metric (D-SLM1779,
-		// below), where the shipped kernel assigned bestRelevance raw.
+		// Metric::Dot/Metric::Cosine path. Neither metric applies a transform to relevance
+		// (no float32 compression risk exists on either -- confirmed, fourth adversarial
+		// strike, Control A). The DISPLAY value is floored uniformly for every metric
+		// (D-SLM1779, below).
 		float bestScore = 0.0f;
 		float bestRelevance = 0.0f;
 		float bestRedundancy = 0.0f;
+
+		// The member selected at the previous step: the one new term every unselected
+		// candidate's running sum gains this step. None at step 0.
+		const int32_t newestPos = (step > 0) ? outSelectedIndices[step - 1] : -1;
 
 		for (int32_t pos = 0; pos < candidateCount; ++pos)
 		{
@@ -110,45 +124,56 @@ Status SelectDiverseMMR(
 
 			const int32_t index = candidates[pos].index;
 
-			// The fork below gives the deferred D-SLM1780 `bestPos == -1` guard two landing
-			// sites in this file, should it ever land: the L2 branch's
-			// `candidateQueries[outSelectedIndices[s]]` dereference just below, and the
-			// Dot/Cosine branch's equivalent further down. The T-1828 oracle fold (103f10f)
-			// forked `RefSelectDiverseMMR`'s per-step body the same way, so the guard has two
-			// more landing sites in `tests/test_main.cpp`
-			// (Claude/Poirot/103f10f-gate0b-remedy-confirmation.md N-3, D-SLM1800). D-SLM1780
-			// remains gated on establishing reachability; this note records where the guard
-			// lands once it is.
+			// The one new redundancy term. ScoreXdPairSegmented is still called at every step
+			// regardless of lambda, so a non-Ok status propagates even at lambda == 1.0
+			// (D-SLM1782 -- redundancy carries weight zero there, but the call is
+			// unconditional). Every earlier pair of this candidate was scored, and returned
+			// Ok, at the step right after its member was selected, so the first non-Ok status
+			// surfaces at the same step, and for the same candidate, as a full recomputation.
+			// The fork below gives the deferred D-SLM1780 `bestPos == -1` guard its landing
+			// site should it ever land: `candidateQueries[newestPos]` is the dereference.
+			if (newestPos >= 0)
+			{
+				float raw = 0.0f;
+				const Status st = ScoreXdPairSegmented(candidateQueries[pos],
+					candidateQueries[newestPos], paddedDims, metric, segments, segmentCount, &raw);
+				if (st != Status::Ok)
+				{
+					return st;
+				}
+
+				// The per-metric redundancy transform (section 6.2): L2 accumulates the
+				// pre-transform ratio sqrt(raw)/L (the ranking-key domain, construction B);
+				// Dot is the identity (already the documented similarity); Cosine recovers
+				// `sum(weight_s) - raw`, the degree-1-homogeneous form that matches
+				// relevance's own channel-weight scaling.
+				double transformed = 0.0;
+				if (metric == Metric::L2)
+				{
+					transformed = L2RankingRatio(static_cast<double>(raw), l2ScaleD);
+				}
+				else if (metric == Metric::Dot)
+				{
+					transformed = static_cast<double>(raw);
+				}
+				else
+				{
+					transformed = cosineWeightSum - static_cast<double>(raw);
+				}
+				redundancyScratch[pos] += transformed;
+			}
+
 			if (metric == Metric::L2)
 			{
 				// The pre-transform ratio, relevance's operand.
 				const double uRel =
 					L2RankingRatio(static_cast<double>(candidates[pos].score), l2ScaleD);
 
-				// Mean of the pairwise pre-transform ratios over already-selected members,
-				// in selection order (step 0's empty set is exactly 0, never a reduction
-				// over zero terms -- the spec's own first-selection convention). Still
-				// calls ScoreXdPairSegmented at every step regardless of lambda, so a
-				// non-Ok status propagates even at lambda == 1.0 (D-SLM1782 -- redundancy
-				// carries weight zero there, but the call is unconditional).
-				double meanURed = 0.0;
-				if (step > 0)
-				{
-					double acc = 0.0;
-					for (int32_t s = 0; s < step; ++s)
-					{
-						float raw = 0.0f;
-						const Status st = ScoreXdPairSegmented(candidateQueries[pos],
-							candidateQueries[outSelectedIndices[s]], paddedDims, metric,
-							segments, segmentCount, &raw);
-						if (st != Status::Ok)
-						{
-							return st;
-						}
-						acc += L2RankingRatio(static_cast<double>(raw), l2ScaleD);
-					}
-					meanURed = acc / static_cast<double>(step);
-				}
+				// Mean of the pairwise pre-transform ratios over already-selected members
+				// (step 0's empty set is exactly 0, never a reduction over zero terms -- the
+				// spec's own first-selection convention).
+				const double meanURed =
+					(step > 0) ? redundancyScratch[pos] / static_cast<double>(step) : 0.0;
 
 				// rankKey(pos) = (1 - lambda) * mean_u_red(pos) - lambda * u_rel(pos)
 				// [maximize]. Algebraically equal to
@@ -180,32 +205,9 @@ Status SelectDiverseMMR(
 			const float relevance = candidates[pos].score;
 
 			// Mean reduction over already-selected members, in selection order.
-			float redundancy = 0.0f;
-			if (step > 0)
-			{
-				double acc = 0.0;
-				for (int32_t s = 0; s < step; ++s)
-				{
-					float raw = 0.0f;
-					const Status st = ScoreXdPairSegmented(candidateQueries[pos],
-						candidateQueries[outSelectedIndices[s]], paddedDims, metric, segments,
-						segmentCount, &raw);
-					if (st != Status::Ok)
-					{
-						return st;
-					}
-
-					// The per-metric redundancy transform (section 6.2): Dot is the
-					// identity (already the documented similarity, no correction needed);
-					// Cosine recovers `sum(weight_s) - raw`, the degree-1-homogeneous form
-					// that matches relevance's own channel-weight scaling.
-					const double transformed = (metric == Metric::Dot)
-						? static_cast<double>(raw)
-						: (cosineWeightSum - static_cast<double>(raw));
-					acc += transformed;
-				}
-				redundancy = XdFloorDiversityLocal(acc / static_cast<double>(step));
-			}
+			const float redundancy = (step > 0)
+				? XdFloorDiversityLocal(redundancyScratch[pos] / static_cast<double>(step))
+				: 0.0f;
 
 			const float score = lambda * relevance - (1.0f - lambda) * redundancy;
 

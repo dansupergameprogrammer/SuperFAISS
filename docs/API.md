@@ -578,6 +578,7 @@ Status SelectDiverseMMR(
     const Hit* candidates, const XdQuery* candidateQueries, int32_t candidateCount,
     int32_t paddedDims, Metric metric, float lambda, int32_t k,
     const QuerySegment* segments, int32_t segmentCount, float l2Scale,
+    double* redundancyScratch,
     int32_t* outSelectedIndices, float* outRelevance, float* outRedundancy);
 ```
 
@@ -588,6 +589,7 @@ Status SelectDiverseMMR(
 | `k` | picks to make; the caller guarantees `1 ≤ k ≤ candidateCount` (not re-checked) |
 | `segments` / `segmentCount` | the query's own resolved channel-weight list, so redundancy weighs channels exactly as relevance did; `0` / `nullptr` is the channelless case |
 | `l2Scale` | `Metric::L2` only: the bank's own scale, `sqrt(SpreadCrossDevice(...))`, computed and cached by the caller, `> 0`; pass `0.0f` for Dot and Cosine |
+| `redundancyScratch` | `candidateCount` doubles, caller-owned; contents ignored on entry, unspecified on return |
 | `outSelectedIndices` | `k` **positions within the pool** (not bank rows), in selection order |
 | `outRelevance` / `outRedundancy` | per-pick display values in selection order, `float32`, subnormals flushed to `0` |
 
@@ -597,16 +599,19 @@ one divide — `Reduce::Mean`'s convention) and is exactly `0` at the first step
 as-is; Cosine recovers similarity as `Σ weight_s − score`. **L2 ranks on the pre-transform ratio
 `sqrt(distance) / l2Scale` in double** and never compares the rounded display transform
 `1 − sqrt(x) / l2Scale`, which is not strictly monotone once rounded to `float32`. Ties break on
-ascending bank row index, `topk.h`'s convention — never on pool position. The first non-Ok status any
+ascending bank row index, `topk.h`'s convention — never on pool position. Each candidate keeps a running
+redundancy sum in `redundancyScratch` that gains one term per step, so every pair is scored once:
+O(k × candidateCount) pair scores, with the same additions in the same order as recomputing the mean
+each step. The first non-Ok status any
 pair score returns is propagated (e.g. `ZeroNormQuery` on a Cosine pool). No allocation; caller owns
 every output.
 
 ```cpp
 // Over-fetch, then pick 10 varied results from the top 40.
-std::vector<int32_t> picked(10); std::vector<float> rel(10), red(10);
+std::vector<int32_t> picked(10); std::vector<float> rel(10), red(10); std::vector<double> scratch(40);
 Status s = SelectDiverseMMR(hits.data(), payloads.data(), 40, paddedDims, Metric::Cosine,
                             /*lambda*/0.7f, /*k*/10, segs, segCount, /*l2Scale*/0.0f,
-                            picked.data(), rel.data(), red.data());
+                            scratch.data(), picked.data(), rel.data(), red.data());
 // picked[i] indexes hits/payloads; hits[picked[i]].index is the bank row.
 ```
 

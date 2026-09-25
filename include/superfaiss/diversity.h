@@ -98,6 +98,16 @@ namespace superfaiss
 // codebase's cross-device subnormal convention. In selection order -- the values the caller
 // renders beside each result row.
 //
+// `redundancyScratch` -- caller-provided, `candidateCount` doubles; contents on entry are
+// ignored and on return unspecified. It holds each candidate's running redundancy sum: every
+// step adds one term per unselected candidate (its score against the member selected at the
+// previous step), so each ScoreXdPairSegmented pair is evaluated once. Cost is therefore
+// O(k x candidateCount) pairwise scores, not the O(k^2 x candidateCount) a per-step
+// recomputation would take. The sum receives the same double additions in the same
+// (selection) order, from the same 0.0, as a recomputation, so the output is identical to
+// it bit for bit. Caller-provided like analytics.h's centroid scratch, so the call itself
+// allocates nothing.
+//
 // Determinism: reuses ScoreXdPairSegmented's already-proven cross-device-exact scoring; the
 // only new nondeterminism surface is the argmax tie-break, closed by the pinned
 // ascending-index rule above. Propagates the first non-Ok Status any ScoreXdPairSegmented
@@ -107,6 +117,7 @@ Status SelectDiverseMMR(
 	const Hit* candidates, const XdQuery* candidateQueries, int32_t candidateCount,
 	int32_t paddedDims, Metric metric, float lambda, int32_t k,
 	const QuerySegment* segments, int32_t segmentCount, float l2Scale,
+	double* redundancyScratch,
 	int32_t* outSelectedIndices, float* outRelevance, float* outRedundancy);
 
 } // namespace superfaiss

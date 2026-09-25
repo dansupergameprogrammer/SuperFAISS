@@ -13034,11 +13034,11 @@ static void TestPerChannelRecallOracle()
 static void TestVersionHeaderCoherence()
 {
 	CHECK_MSG(SUPERFAISS_VERSION_MAJOR == 3,
-		"SUPERFAISS_VERSION_MAJOR should be 3 for v3.3.0, got %d", SUPERFAISS_VERSION_MAJOR);
-	CHECK_MSG(SUPERFAISS_VERSION_MINOR == 3,
-		"SUPERFAISS_VERSION_MINOR should be 3 for v3.3.0, got %d", SUPERFAISS_VERSION_MINOR);
+		"SUPERFAISS_VERSION_MAJOR should be 3 for v3.4.0, got %d", SUPERFAISS_VERSION_MAJOR);
+	CHECK_MSG(SUPERFAISS_VERSION_MINOR == 4,
+		"SUPERFAISS_VERSION_MINOR should be 4 for v3.4.0, got %d", SUPERFAISS_VERSION_MINOR);
 	CHECK_MSG(SUPERFAISS_VERSION_PATCH == 0,
-		"SUPERFAISS_VERSION_PATCH should be 0 for v3.3.0, got %d", SUPERFAISS_VERSION_PATCH);
+		"SUPERFAISS_VERSION_PATCH should be 0 for v3.4.0, got %d", SUPERFAISS_VERSION_PATCH);
 }
 
 // ===========================================================================
@@ -21037,6 +21037,19 @@ static float ComputeL2ScaleForBank(const TestBank& bank)
 	return static_cast<float>(std::sqrt(static_cast<double>(spread)));
 }
 
+// SelectDiverseMMR's caller-provided redundancy scratch (candidateCount doubles). One
+// buffer reused by every call in this file; it only ever grows, and the allocation-flatness
+// cell sizes it in its warm-up call before tracking starts.
+static double* MmrScratch(int32_t candidateCount)
+{
+	static std::vector<double> buffer;
+	if (buffer.size() < static_cast<size_t>(candidateCount))
+	{
+		buffer.resize(static_cast<size_t>(candidateCount));
+	}
+	return buffer.data();
+}
+
 static void TestDiversityMMR()
 {
 	std::printf(
@@ -21116,7 +21129,7 @@ static void TestDiversityMMR()
 			std::vector<float> rel(static_cast<size_t>(k), 0.0f);
 			std::vector<float> red(static_cast<size_t>(k), -1.0f);
 			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				bank.view.paddedDims, metrics[m], 1.0f, k, nullptr, 0, l2Scale, sel.data(),
+				bank.view.paddedDims, metrics[m], 1.0f, k, nullptr, 0, l2Scale, MmrScratch(candidateCount), sel.data(),
 				rel.data(), red.data()) == Status::Ok);
 			for (int32_t i = 0; i < k; ++i)
 			{
@@ -21146,7 +21159,7 @@ static void TestDiversityMMR()
 			std::vector<float> rel(static_cast<size_t>(k), 0.0f);
 			std::vector<float> red(static_cast<size_t>(k), -1.0f);
 			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				bank.view.paddedDims, metrics[m], lambda, k, nullptr, 0, l2Scale, sel.data(),
+				bank.view.paddedDims, metrics[m], lambda, k, nullptr, 0, l2Scale, MmrScratch(candidateCount), sel.data(),
 				rel.data(), red.data()) == Status::Ok);
 
 			std::vector<int32_t> refSel(static_cast<size_t>(k), -1);
@@ -21176,10 +21189,10 @@ static void TestDiversityMMR()
 			std::vector<float> relA(static_cast<size_t>(k)), relB(static_cast<size_t>(k));
 			std::vector<float> redA(static_cast<size_t>(k)), redB(static_cast<size_t>(k));
 			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				bank.view.paddedDims, metrics[m], 0.5f, k, nullptr, 0, l2Scale, selA.data(),
+				bank.view.paddedDims, metrics[m], 0.5f, k, nullptr, 0, l2Scale, MmrScratch(candidateCount), selA.data(),
 				relA.data(), redA.data()) == Status::Ok);
 			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				bank.view.paddedDims, metrics[m], 0.5f, k, nullptr, 0, l2Scale, selB.data(),
+				bank.view.paddedDims, metrics[m], 0.5f, k, nullptr, 0, l2Scale, MmrScratch(candidateCount), selB.data(),
 				relB.data(), redB.data()) == Status::Ok);
 			CHECK(selA == selB);
 			CHECK(relA == relB);
@@ -21202,7 +21215,7 @@ static void TestDiversityMMR()
 			std::vector<float> rel(static_cast<size_t>(k), 0.0f);
 			std::vector<float> red(static_cast<size_t>(k), -1.0f);
 			const Status st = SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				pd2, metrics[m], 0.4f, k, segs, 2, l2Scale, sel.data(), rel.data(), red.data());
+				pd2, metrics[m], 0.4f, k, segs, 2, l2Scale, MmrScratch(candidateCount), sel.data(), rel.data(), red.data());
 
 			std::vector<int32_t> refSel(static_cast<size_t>(k), -1);
 			std::vector<float> refRel(static_cast<size_t>(k), 0.0f);
@@ -21257,7 +21270,7 @@ static void TestDiversityMMR()
 				std::vector<float> rel2x(static_cast<size_t>(k), 0.0f);
 				std::vector<float> red2x(static_cast<size_t>(k), -1.0f);
 				CHECK(SelectDiverseMMR(candidates2x.data(), queries.data(), candidateCount, pd2,
-					metrics[m], 0.4f, k, segs2x, 2, l2Scale, sel2x.data(), rel2x.data(),
+					metrics[m], 0.4f, k, segs2x, 2, l2Scale, MmrScratch(candidateCount), sel2x.data(), rel2x.data(),
 					red2x.data()) == Status::Ok);
 				for (int32_t i = 0; i < k; ++i)
 				{
@@ -21312,7 +21325,7 @@ static void TestDiversityMMR()
 			std::vector<float> rel(static_cast<size_t>(k), 0.0f);
 			std::vector<float> red(static_cast<size_t>(k), -1.0f);
 			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				bank.view.paddedDims, Metric::L2, lambda, k, nullptr, 0, l2Scale, sel.data(),
+				bank.view.paddedDims, Metric::L2, lambda, k, nullptr, 0, l2Scale, MmrScratch(candidateCount), sel.data(),
 				rel.data(), red.data()) == Status::Ok);
 
 			std::vector<int32_t> refSel(static_cast<size_t>(k), -1);
@@ -21355,7 +21368,7 @@ static void TestDiversityMMR()
 		std::vector<float> rel(static_cast<size_t>(k), 0.0f);
 		std::vector<float> red(static_cast<size_t>(k), -1.0f);
 		CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-			bank.view.paddedDims, Metric::Dot, 1.0f, k, nullptr, 0, 0.0f, sel.data(), rel.data(),
+			bank.view.paddedDims, Metric::Dot, 1.0f, k, nullptr, 0, 0.0f, MmrScratch(candidateCount), sel.data(), rel.data(),
 			red.data()) == Status::Ok);
 		CHECK_MSG(sel[0] == 1, "tie-break: step 0 selected pos %d, expected pos 1 (index 2)",
 			sel[0]);
@@ -21383,7 +21396,7 @@ static void TestDiversityMMR()
 		std::vector<float> rel(2, 0.0f);
 		std::vector<float> red(2, -1.0f);
 		const Status st = SelectDiverseMMR(candidates.data(), queries.data(), 2, paddedDims,
-			Metric::Cosine, 0.5f, 2, nullptr, 0, 0.0f, sel.data(), rel.data(), red.data());
+			Metric::Cosine, 0.5f, 2, nullptr, 0, 0.0f, MmrScratch(2), sel.data(), rel.data(), red.data());
 		CHECK_MSG(st == Status::ZeroNormQuery,
 			"zero-norm candidate: SelectDiverseMMR returned status %d, expected ZeroNormQuery",
 			static_cast<int>(st));
@@ -21409,7 +21422,7 @@ static void TestDiversityMMR()
 		std::vector<float> rel(2, 0.0f);
 		std::vector<float> red(2, -1.0f);
 		const Status st = SelectDiverseMMR(candidates.data(), queries.data(), 2, paddedDims,
-			Metric::Cosine, 0.5f, 2, segs, 2, 0.0f, sel.data(), rel.data(), red.data());
+			Metric::Cosine, 0.5f, 2, segs, 2, 0.0f, MmrScratch(2), sel.data(), rel.data(), red.data());
 		CHECK_MSG(st == Status::ZeroNormQuery,
 			"weighted zero-norm candidate: SelectDiverseMMR returned status %d, expected "
 			"ZeroNormQuery", static_cast<int>(st));
@@ -21448,7 +21461,7 @@ static void TestDiversityMMR()
 		std::vector<float> rel(2, 0.0f);
 		std::vector<float> red(2, -1.0f);
 		CHECK(SelectDiverseMMR(pooledCandidates.data(), pool.data(), 3, paddedDims, Metric::Cosine,
-			0.5f, 2, nullptr, 0, 0.0f, sel.data(), rel.data(), red.data()) == Status::Ok);
+			0.5f, 2, nullptr, 0, 0.0f, MmrScratch(3), sel.data(), rel.data(), red.data()) == Status::Ok);
 		CHECK_MSG(sel[0] == 0,
 			"crux fixture: step 0 must pick the highest-relevance seed, got pos %d", sel[0]);
 		CHECK(red[0] == 0.0f);
@@ -21504,7 +21517,7 @@ static void TestDiversityMMR()
 		std::vector<float> rel(2, 0.0f);
 		std::vector<float> red(2, -1.0f);
 		CHECK(SelectDiverseMMR(pooledCandidates.data(), pool.data(), 3, paddedDims, Metric::L2,
-			0.5f, 2, nullptr, 0, l2Scale, sel.data(), rel.data(), red.data()) == Status::Ok);
+			0.5f, 2, nullptr, 0, l2Scale, MmrScratch(3), sel.data(), rel.data(), red.data()) == Status::Ok);
 		CHECK_MSG(sel[0] == 0,
 			"L2 crux fixture: step 0 must pick the highest-relevance seed, got pos %d", sel[0]);
 		CHECK(red[0] == 0.0f);
@@ -21534,7 +21547,7 @@ static void TestDiversityMMR()
 		std::vector<float> rel(1, -1.0f);
 		std::vector<float> red(1, -1.0f);
 		CHECK(SelectDiverseMMR(candidates.data(), pool.data(), 1, paddedDims, Metric::Dot, 1.0f, 1,
-			nullptr, 0, 0.0f, sel.data(), rel.data(), red.data()) == Status::Ok);
+			nullptr, 0, 0.0f, MmrScratch(1), sel.data(), rel.data(), red.data()) == Status::Ok);
 		CHECK_MSG(rel[0] == 0.0f,
 			"Dot subnormal display floor: relevance %.9g != 0 (Hit.score %.9g is subnormal and "
 			"must flush to exactly 0.0f per the header's D-SLM1779 floor promise)",
@@ -21566,7 +21579,7 @@ static void TestAllocFlatDiversity()
 	const QuerySegment segs[1] = {{0, bank.view.paddedDims, 1.0f}};
 
 	CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-		bank.view.paddedDims, Metric::Dot, 0.5f, k, segs, 1, 0.0f, sel.data(), rel.data(),
+		bank.view.paddedDims, Metric::Dot, 0.5f, k, segs, 1, 0.0f, MmrScratch(candidateCount), sel.data(), rel.data(),
 		red.data()) == Status::Ok);
 
 	const uint64_t allocsBefore = AllocationCount();
@@ -21575,7 +21588,7 @@ static void TestAllocFlatDiversity()
 		for (int32_t i = 0; i < 10; ++i)
 		{
 			CHECK(SelectDiverseMMR(candidates.data(), queries.data(), candidateCount,
-				bank.view.paddedDims, Metric::Dot, 0.5f, k, segs, 1, 0.0f, sel.data(), rel.data(),
+				bank.view.paddedDims, Metric::Dot, 0.5f, k, segs, 1, 0.0f, MmrScratch(candidateCount), sel.data(), rel.data(),
 				red.data()) == Status::Ok);
 		}
 		CHECK_MSG(rawTracking.Count() == 0,

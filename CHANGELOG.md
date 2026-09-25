@@ -18,7 +18,8 @@ by feature tier (minor = new capability, patch = fix), not strict SemVer of a pu
   is plain relevance order. Redundancy weighs channels with the query's own segment list, ties
   break on ascending bank row index, and on `Metric::L2` the comparison ranks on an unrounded
   double key, so a `float32` rounding of the display value can never reorder two candidates.
-  Cross-device deterministic; no allocation.
+  Each candidate's redundancy is a running sum in a caller-provided scratch buffer, so every pair
+  is scored once: O(k × pool) pair scores. Cross-device deterministic; no allocation.
 - **`ScoreXdPairSegmented`** (`analytics.h`) — `ScoreXdPair` weighted over a `QuerySegment` list,
   the pairwise counterpart of the segmented scan. With no segments it is bit-identical to
   `ScoreXdPair`. It refuses a negative segment weight, and on Cosine it refuses only an operand
