@@ -9,7 +9,7 @@ per entry. Reconstructed from git history 2026-07-12.
 The format follows [Keep a Changelog](https://keepachangelog.com); this project versions
 by feature tier (minor = new capability, patch = fix), not strict SemVer of a public ABI.
 
-## [3.4.0] — unreleased
+## [3.4.0] — 2026-09-24
 
 ### Added
 - **`SelectDiverseMMR`** (`diversity.h`) — greedy Maximal Marginal Relevance selection over an

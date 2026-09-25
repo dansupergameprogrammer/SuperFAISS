@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/dansupergameprogrammer/superfaiss/actions/workflows/tests.yml/badge.svg)](https://github.com/dansupergameprogrammer/superfaiss/actions/workflows/tests.yml)
 
-**Current release: [v3.3.0](https://github.com/dansupergameprogrammer/superfaiss/releases/tag/v3.3.0)** — what each release added is in [CHANGELOG.md](CHANGELOG.md). Version markers in the feature list below record when a capability landed, not the current version.
+**Current release: [v3.4.0](https://github.com/dansupergameprogrammer/superfaiss/releases/tag/v3.4.0)** — what each release added is in [CHANGELOG.md](CHANGELOG.md). Version markers in the feature list below record when a capability landed, not the current version.
 
 Fast, deterministic, allocation-free k-nearest-neighbor search for game runtimes —
 over banks you bake in your pipeline or grow at play time. One bank answers many
