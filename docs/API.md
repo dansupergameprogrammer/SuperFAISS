@@ -307,6 +307,10 @@ mean / order-free max); the full contract is [DETERMINISM.md](DETERMINISM.md) §
 Status ScoreXdPair(const XdQuery& a, const XdQuery& b, int32_t paddedDims, Metric metric,
                    float* outScore);                                   // the pair score all others rest on
 
+Status ScoreXdPairSegmented(const XdQuery& a, const XdQuery& b, int32_t paddedDims,   // v3.4: ScoreXdPair over a
+                            Metric metric, const QuerySegment* segments,             // weighted segment list
+                            int32_t segmentCount, float* outScore);
+
 Status CentroidDistanceCrossDevice(                                   // set-to-set; drift = this between two checkpoints
     const BankView& bankA, const int32_t* rowIndicesA, int32_t rowCountA,
     const int32_t* weightsA, const uint32_t* excludeBitsA,
@@ -339,6 +343,7 @@ Status ProjectionReport(const BankView& bank, const float* paddedDirection,     
 |---|---|---|
 | `Dot` | a dot **similarity** (`a.scale · b.scale · crossDot`) | **larger = MORE similar** — NOT a distance; a `Dot` consumer reads it with that convention |
 | `Cosine` | `1 − crossDot / sqrt(a.sqSum · b.sqSum)`, in `[0, 2]` | larger = farther |
+| `Cosine`, `ScoreXdPairSegmented` | `Σ weight_s · (1 − cross_s / sqrt(aSq_s · bSq_s))` over the resolved ranges, in `[0, 2·Σ weight_s]` | larger = farther |
 | `L2` | squared Euclidean distance | larger = farther |
 
 The nearest-neighbour divergences score in the **target** bank's metric by the same
@@ -349,6 +354,7 @@ table. `ProjectionReport` is a plain per-row dot projection (float), unaffected.
 | Operator | Caller scratch |
 |---|---|
 | `ScoreXdPair` | none |
+| `ScoreXdPairSegmented` | none (its resolved-range array lives on the stack, `2·kMaxSegments + 1` entries) |
 | `CentroidDistanceCrossDevice` | two int8 buffers, `paddedDims` bytes each, 16-aligned |
 | `MeanNNCrossDevice` / `MaxNNCrossDevice` | `source.count ×` (`XdQuery` + `Hit` + `int32`) — `sizeof(XdQuery)+sizeof(Hit)+4` = 36 bytes/source-row on a 64-bit target — plus a `Workspace` reserved for `k = 1` |
 | `SpreadCrossDevice` | one int8 buffer, `paddedDims` bytes, 16-aligned |
@@ -419,6 +425,19 @@ that reservation fails (v3.3).
 "This mind's identity is drifting but its appearance is stable" is a `CentroidDistanceCross
 DeviceChannel` over the identity channel versus the appearance channel across checkpoints.
 Determinism per channel: [DETERMINISM.md §2e](DETERMINISM.md).
+
+**Segmented pair score (v3.4).** `ScoreXdPairSegmented` is `ScoreXdPair` weighted over a
+caller-supplied `QuerySegment` list — the pairwise counterpart of the segmented scan — so a
+query-vs-query comparison can weigh channels the way a retrieval query does. The total is
+`Σ weight_s · partial_s`, summed in ascending-offset range order; each partial is the same
+fixed-order double epilogue `ScoreXdPair` uses, and on Cosine each range is its own true
+`1 − cross_s / sqrt(aSq_s · bSq_s)`. `segmentCount == 0` or `segments == nullptr` scores the one
+implicit full-row segment and is bit-identical to `ScoreXdPair`. It validates both payloads by the
+same law as `ScoreXdPair`, and the segment list by the same structural rules as the segmented scan
+(ascending, non-overlapping, on the 16-element grid, within `paddedDims`), with two differences: a
+**negative weight is refused** (`InvalidArgument`), and on Cosine the only zero-norm refusal is an
+operand whose **aggregate** weighted self-norm is zero (`ZeroNormQuery`) — a row empty on one
+weighted channel but not overall is scored, not refused.
 
 ## pca.h — inspection projections (v1.1)
 
@@ -547,6 +566,54 @@ shipped reference bank. PER-DEVICE deterministic, no cross-device claim. This is
 library's disclosed HEAVY pass — O(sample x full-B x dims) plus back-verification, linear
 in bank size, not sub-second at scale; a caller-side concern (chunking, progress, cancel),
 not part of this contract.
+
+## diversity.h — MMR diversity selection (v3.4)
+
+Greedy Maximal Marginal Relevance over an already-retrieved candidate pool: re-rank an over-fetched
+result list so each next pick is relevant **and** unlike what was already picked. Cross-device like
+the analytics above — the redundancy term is `ScoreXdPairSegmented`.
+
+```cpp
+Status SelectDiverseMMR(
+    const Hit* candidates, const XdQuery* candidateQueries, int32_t candidateCount,
+    int32_t paddedDims, Metric metric, float lambda, int32_t k,
+    const QuerySegment* segments, int32_t segmentCount, float l2Scale,
+    double* redundancyScratch,
+    int32_t* outSelectedIndices, float* outRelevance, float* outRedundancy);
+```
+
+| Argument | Meaning |
+|---|---|
+| `candidates` / `candidateQueries` | the pool, paired by position: each `Hit`'s raw relevance score (the metric's native scale) and bank row index, and the same row as an `XdQuery` payload |
+| `lambda` | in `[0, 1]`; `1` is pure relevance order (a property of the formula, not a special case), lower trades relevance for spread |
+| `k` | picks to make; the caller guarantees `1 ≤ k ≤ candidateCount` (not re-checked) |
+| `segments` / `segmentCount` | the query's own resolved channel-weight list, so redundancy weighs channels exactly as relevance did; `0` / `nullptr` is the channelless case |
+| `l2Scale` | `Metric::L2` only: the bank's own scale, `sqrt(SpreadCrossDevice(...))`, computed and cached by the caller, `> 0`; pass `0.0f` for Dot and Cosine |
+| `redundancyScratch` | `candidateCount` doubles, caller-owned; contents ignored on entry, unspecified on return |
+| `outSelectedIndices` | `k` **positions within the pool** (not bank rows), in selection order |
+| `outRelevance` / `outRedundancy` | per-pick display values in selection order, `float32`, subnormals flushed to `0` |
+
+Each step maximizes `lambda · relevance − (1 − lambda) · redundancy`, where redundancy is the mean
+similarity to the members already picked (double accumulation in selection order,
+one divide — `Reduce::Mean`'s convention) and is exactly `0` at the first step. The combination is
+formed in double. Dot uses the pair score as-is; Cosine recovers similarity as `Σ weight_s − score`. **L2 ranks on the pre-transform ratio
+`sqrt(distance) / l2Scale` in double** and never compares the rounded display transform
+`1 − sqrt(x) / l2Scale`, which is not strictly monotone once rounded to `float32`. Ties break on
+ascending bank row index, `topk.h`'s convention — never on pool position. Each candidate keeps a running
+redundancy sum in `redundancyScratch` that gains one term per step, so every pair is scored once:
+O(k × candidateCount) pair scores, with the same additions in the same order as recomputing the mean
+each step. The first non-Ok status any
+pair score returns is propagated (e.g. `ZeroNormQuery` on a Cosine pool). No allocation; caller owns
+every output.
+
+```cpp
+// Over-fetch, then pick 10 varied results from the top 40.
+std::vector<int32_t> picked(10); std::vector<float> rel(10), red(10); std::vector<double> scratch(40);
+Status s = SelectDiverseMMR(hits.data(), payloads.data(), 40, paddedDims, Metric::Cosine,
+                            /*lambda*/0.7f, /*k*/10, segs, segCount, /*l2Scale*/0.0f,
+                            scratch.data(), picked.data(), rel.data(), red.data());
+// picked[i] indexes hits/payloads; hits[picked[i]].index is the bank row.
+```
 
 ## scratch.h — mutable banks (v2.0, recall audit v2.3)
 

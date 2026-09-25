@@ -192,6 +192,14 @@ is proven across the CI forced-path + cross-runner golden battery with an advers
 tiny-channel-norm member, and a bit-exact Cosine channel-analytics REF (an independent
 integer-domain recode of the epilogue) asserts the operator matches the contract.
 
+The v3.4 additions are built from the same pieces. `ScoreXdPairSegmented` is `ScoreXdPair`'s
+epilogue per resolved range, weighted and summed in ascending-offset order; its degenerate
+channelless call is bit-identical to `ScoreXdPair`. `SelectDiverseMMR` adds a double-precision
+greedy argmax over those pair scores, a mean in selection order, and a tie-break pinned to ascending
+bank row index, so its selection does not depend on pool order. Its L2 ranking key takes one true
+`sqrt` per pair, which carries the build condition above. Both are versioned composition operators
+under the same rule as the v2.5 operators.
+
 `ProjectionReport` (v2.5) is per-device float only — an offline authoring/inspection tool
 with no cross-device claim — and stands outside this contract.
 

@@ -62,6 +62,47 @@ inline bool IsInt8CrossDevice(const BankView& bank)
 		bank.paddedDims <= kMaxCrossDeviceDims;
 }
 
+// ScoreXdPairSegmented's own resolved-range structure (plan section 6.2). Named distinctly
+// from kernels.cpp's file-local FScanRange/BuildScanRanges: the plugin vendors every core
+// .cpp into ONE translation unit, where two file-local symbols sharing a name collide (C2084)
+// even though each compiles cleanly standalone (the same reason diversity.cpp's own
+// XdFloorDiversityLocal carries its file's name). No channel-match field -- this primitive
+// scores two already-lifted XdQuery payloads, not a bank row, so it has no BankView to
+// resolve a channel index against.
+struct SegPairRange
+{
+	int32_t offset;
+	int32_t length;
+	float weight; // 0 for a gap or a weight-0 segment (discarded, like BuildScanRanges' rule)
+};
+
+// Builds the full-coverage resolved-range list for ScoreXdPairSegmented: the caller's
+// (already-validated) segments in order, gaps filled between and after, mirroring
+// BuildScanRanges' own convention (kernels.cpp) rather than sharing code with it across
+// translation units. At most `2*kMaxSegments + 1` ranges -- the identical bound
+// BuildScanRanges documents -- so `outRanges` must be sized to that, never to `kMaxSegments`.
+inline int32_t BuildSegPairRanges(const QuerySegment* segments, int32_t segmentCount,
+	int32_t paddedDims, SegPairRange* outRanges)
+{
+	int32_t n = 0;
+	int32_t cursor = 0;
+	for (int32_t i = 0; i < segmentCount; ++i)
+	{
+		const QuerySegment& seg = segments[i];
+		if (seg.offset > cursor)
+		{
+			outRanges[n++] = {cursor, seg.offset - cursor, 0.0f};
+		}
+		outRanges[n++] = {seg.offset, seg.length, seg.weight};
+		cursor = seg.offset + seg.length;
+	}
+	if (cursor < paddedDims)
+	{
+		outRanges[n++] = {cursor, paddedDims - cursor, 0.0f};
+	}
+	return n;
+}
+
 // True if any image element is INT8_MIN (-128). The ±127 premise the int32 cross-dot
 // bound rests on (plan W1) admits only [-127, 127]; a -128 element at paddedDims near the
 // ceiling overflows the int32 accumulator (D-V2-13). Checked at the public boundary before
@@ -135,6 +176,167 @@ Status ScoreXdPair(const XdQuery& a, const XdQuery& b, int32_t paddedDims, Metri
 		return Status::ZeroNormQuery;
 	}
 	*outScore = XdPairScore(a, b, paddedDims, metric);
+	return Status::Ok;
+}
+
+Status ScoreXdPairSegmented(const XdQuery& a, const XdQuery& b, int32_t paddedDims,
+	Metric metric, const QuerySegment* segments, int32_t segmentCount, float* outScore)
+{
+	// The identical ScoreXdPair payload law, both members, over the full paddedDims row --
+	// unchanged from ScoreXdPair itself (this function's own doc comment).
+	if (outScore == nullptr || a.q8 == nullptr || b.q8 == nullptr || paddedDims <= 0 ||
+		paddedDims > kMaxCrossDeviceDims)
+	{
+		return Status::InvalidArgument;
+	}
+	if (!std::isfinite(a.scale) || a.scale < 0.0 || !std::isfinite(b.scale) || b.scale < 0.0)
+	{
+		return Status::InvalidArgument;
+	}
+	if (HasMinInt8(a.q8, paddedDims) || HasMinInt8(b.q8, paddedDims))
+	{
+		return Status::InvalidArgument;
+	}
+	if (detail::DotI8I8(a.q8, a.q8, paddedDims) != a.sqSum ||
+		detail::DotI8I8(b.q8, b.q8, paddedDims) != b.sqSum)
+	{
+		return Status::InvalidArgument;
+	}
+
+	if (segmentCount < 0 || segmentCount > kMaxSegments)
+	{
+		return Status::InvalidArgument;
+	}
+
+	// The degenerate full-row path (this function's doc comment, section 6.2): TWO
+	// independent triggers -- segmentCount == 0, OR segments == nullptr -- either one alone
+	// selects it (D-SLM1311: a null `segments` with a positive `segmentCount` is legal input
+	// that must also take this path, not fall through to a null-pointer dereference in the
+	// structural-validation loop below). Bit-identical to ScoreXdPair -- reuses the same
+	// internal XdPairScore helper and the same whole-row Cosine zero-norm trigger.
+	if (segmentCount == 0 || segments == nullptr)
+	{
+		if (metric == Metric::Cosine && (a.sqSum == 0 || b.sqSum == 0))
+		{
+			return Status::ZeroNormQuery;
+		}
+		*outScore = XdPairScore(a, b, paddedDims, metric);
+		return Status::Ok;
+	}
+
+	// Local structural validation (ValidateSegments' rules, minus the count lower bound of
+	// 1 and the separate per-segment zero-sub-norm trigger, plus one departure ValidateSegments
+	// does NOT carry -- all three named departures, this function's own doc comment):
+	// offsets/lengths positive, on the 16-byte int8-quantization element grid, ascending and
+	// non-overlapping, ending within paddedDims, weights finite AND non-negative (D-SLM1315,
+	// folding D-SLM1312: a negative weight is not merely unneeded by the per-metric combine
+	// below -- it breaks it, cancelling Cosine's weighted self-norm to a spurious
+	// Status::ZeroNormQuery on a nonzero-norm payload, or driving L2's raw total negative, a
+	// downstream sqrt of which is NaN under Status::Ok. ValidateSegments (src/validate.cpp)
+	// checks finiteness only and tolerates a negative weight; this primitive is stricter).
+	const int32_t grid = kAlignment / ElementSize(Quantization::Int8);
+	int32_t cursor = 0;
+	for (int32_t s = 0; s < segmentCount; ++s)
+	{
+		const QuerySegment& seg = segments[s];
+		if (seg.offset < 0 || seg.length <= 0 || !std::isfinite(seg.weight) || seg.weight < 0.0f)
+		{
+			return Status::InvalidArgument;
+		}
+		if (seg.offset % grid != 0 || seg.length % grid != 0)
+		{
+			return Status::InvalidArgument;
+		}
+		if (seg.offset < cursor)
+		{
+			return Status::InvalidArgument; // unsorted or overlapping the previous segment
+		}
+		const int64_t end = static_cast<int64_t>(seg.offset) + seg.length;
+		if (end > paddedDims)
+		{
+			return Status::InvalidArgument;
+		}
+		cursor = static_cast<int32_t>(end);
+	}
+
+	// The resolved-range working array: sized 2*kMaxSegments+1, never kMaxSegments (this
+	// function's own doc comment, and BuildSegPairRanges' own bound above).
+	SegPairRange ranges[2 * kMaxSegments + 1];
+	const int32_t rangeCount = BuildSegPairRanges(segments, segmentCount, paddedDims, ranges);
+
+	if (metric == Metric::Dot)
+	{
+		double total = 0.0;
+		for (int32_t r = 0; r < rangeCount; ++r)
+		{
+			const SegPairRange& rg = ranges[r];
+			if (rg.weight == 0.0f)
+			{
+				continue; // gap or weight-0 segment: contributes nothing, not scored
+			}
+			const int32_t cross = detail::DotI8I8(a.q8 + rg.offset, b.q8 + rg.offset, rg.length);
+			const double partial = XdDot(cross, a.scale, b.scale);
+			total += static_cast<double>(rg.weight) * partial;
+		}
+		*outScore = XdFloor(total);
+		return Status::Ok;
+	}
+
+	if (metric == Metric::L2)
+	{
+		double total = 0.0;
+		for (int32_t r = 0; r < rangeCount; ++r)
+		{
+			const SegPairRange& rg = ranges[r];
+			if (rg.weight == 0.0f)
+			{
+				continue;
+			}
+			// Sub-range self-dot recomputed directly (SpreadCrossDeviceChannel's own
+			// convention for channel-scoped analytics) -- not read from a whole-row sqSum.
+			const int64_t aSq = detail::DotI8I8(a.q8 + rg.offset, a.q8 + rg.offset, rg.length);
+			const int64_t bSq = detail::DotI8I8(b.q8 + rg.offset, b.q8 + rg.offset, rg.length);
+			const int64_t cross = detail::DotI8I8(a.q8 + rg.offset, b.q8 + rg.offset, rg.length);
+			const double partial = XdL2(cross, aSq, bSq, a.scale, b.scale);
+			total += static_cast<double>(rg.weight) * partial;
+		}
+		*outScore = XdFloor(total);
+		return Status::Ok;
+	}
+
+	// Metric::Cosine -- convention (ii), the D-INSP-57 adopted closed form: each range's own
+	// TRUE per-range cosine, weighted and summed as a distance (1 - cos_s). A live range
+	// whose per-range self-dot is zero on either operand floors that range's cos_s to 0 (the
+	// same "zero sub-vector scores a defined 0" reading XdChannelPairScore already
+	// establishes). The ONE ZeroNormQuery trigger is the AGGREGATE weighted self-norm over
+	// the live ranges, either operand, being exactly zero -- not a per-range rule.
+	double total = 0.0;
+	double weightedASq = 0.0;
+	double weightedBSq = 0.0;
+	for (int32_t r = 0; r < rangeCount; ++r)
+	{
+		const SegPairRange& rg = ranges[r];
+		if (rg.weight == 0.0f)
+		{
+			continue;
+		}
+		const int64_t aSq = detail::DotI8I8(a.q8 + rg.offset, a.q8 + rg.offset, rg.length);
+		const int64_t bSq = detail::DotI8I8(b.q8 + rg.offset, b.q8 + rg.offset, rg.length);
+		const int64_t cross = detail::DotI8I8(a.q8 + rg.offset, b.q8 + rg.offset, rg.length);
+		const double w = static_cast<double>(rg.weight);
+		weightedASq += w * static_cast<double>(aSq);
+		weightedBSq += w * static_cast<double>(bSq);
+		const double cos_s = (aSq == 0 || bSq == 0)
+			? 0.0
+			: static_cast<double>(cross) /
+				std::sqrt(static_cast<double>(aSq) * static_cast<double>(bSq));
+		total += w * (1.0 - cos_s);
+	}
+	if (weightedASq == 0.0 || weightedBSq == 0.0)
+	{
+		return Status::ZeroNormQuery;
+	}
+	*outScore = XdFloor(total);
 	return Status::Ok;
 }
 

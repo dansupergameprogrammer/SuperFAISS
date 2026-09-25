@@ -16,6 +16,9 @@
 #include "pca.h"
 #include "scratch.h"
 
+// V3.4 diversity (drift-and-diversity plan section 6).
+#include "diversity.h"
+
 // V3.2 Bank Inspector I, Tier 1.
 #include "inspector_common.h"
 #include "graph.h"
