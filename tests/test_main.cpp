@@ -19912,11 +19912,11 @@ static void BuildRowQueries(const BankView& bank, int32_t count,
 // V3.4 Gate 0b core suite -- ScoreXdPairSegmented (new primitive, analytics.h/
 // .cpp) and SelectDiverseMMR's rebuilt redundancy term (diversity.h/.cpp),
 // authored red-first against the drift-and-diversity plan's Gate 0b
-// specification (Claude/Plans/SuperFAISSUnreal_3.4_DriftDiversity_Plan.md
+// specification (the development records,
 // sections 6.1/6.2/12, twenty-fifth revision). Every cell below traces to a
 // Coverage Model dimension (noted per cell) or is filed as a model gap in the
-// test-design case file (Claude/Curie/
-// superfaissunreal-3.4-gate0b-core-test-design-2026-08-06.md).
+// test-design case file kept in the development records
+// (superfaissunreal-3.4-gate0b-core-test-design-2026-08-06.md).
 //
 // CORRECTION (2026-08-06): an earlier revision of this suite scoped
 // Metric::L2 out of every SelectDiverseMMR-level cell, on the reasoning that
@@ -20152,7 +20152,7 @@ static bool ProbeScoreXdPairSegmentedNoCrash(
 }
 #endif
 
-// --- dim 2 (D-SLM1311, Poirot F-1, Critical, fixed and mutation-proven --
+// --- dim 2 (D-SLM1311, the code reviewer F-1, Critical, fixed and mutation-proven --
 // see this cell's own crash-isolation probe above): section 6.2 states the
 // degenerate full-row path is selected by "segmentCount == 0 (or segments ==
 // nullptr)" -- an OR of two independent conditions, so a null `segments`
@@ -21285,7 +21285,7 @@ static void TestDiversityMMR()
 
 	// --- Compression-region L2 cross-check (T-1828, D-SLM1787/1788): four candidates
 	// whose pre-transform ratios sit 4e-8 apart at u ~ 0.1 -- the fourth adversarial
-	// strike's own onset measurement (Claude/Loki/t1827-probe: resolution loss onsets at
+	// strike's own onset measurement (the development records: resolution loss onsets at
 	// u = 0.706631 and grows below it) -- with Hit.index DESCENDING so a float32(1-u)
 	// collision's ascending-index tie-break would invert the true winner. `sel[0] == 0`
 	// is the HAND-DERIVED ground truth, independent of either implementation below: raw
@@ -21431,7 +21431,7 @@ static void TestDiversityMMR()
 	// --- The crux (dim 7, D-INSP-47): the corrected Cosine redundancy term selects
 	// the diverse candidate over a near-duplicate at lambda=0.5, equal relevance --
 	// the shipped kernel (subtracting ScoreXdPair's raw 1-cos output unchanged)
-	// selects the duplicate instead (the polarity inversion Curie's oracle
+	// selects the duplicate instead (the polarity inversion the test author's oracle
 	// commission found executed against the pre-fix kernel). This is the cell whose
 	// absence let the pre-fix kernel ship.
 	{
