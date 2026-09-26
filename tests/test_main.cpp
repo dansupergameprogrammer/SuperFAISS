@@ -34,9 +34,9 @@
 
 // Crash-isolation backend for the null-`segments` regression probe
 // (ProbeScoreXdPairSegmentedNoCrash / TestScoreXdPairSegmentedNullSegments
-// PositiveCountIsLegal, D-SLM1311/D-SLM1343): system includes belong at file
+// PositiveCountIsLegal): system includes belong at file
 // scope like every other header this file pulls in, not buried mid-file
-// (D-SLM1351, surviving from the prior review's R-3 through the portability
+// (surviving from the prior review's R-3 through the portability
 // rework that widened it from one mid-file include to three) -- SEH on
 // MSVC, POSIX signal handling elsewhere.
 #if defined(_MSC_VER)
@@ -1136,7 +1136,7 @@ static void TestSimdEqualsScalar()
 }
 
 // ---------------------------------------------------------------------------
-// T11b — AVX2 sub-8 float32 remainder (regression, T-099 slot-5 spinoff). A float32
+// T11b — AVX2 sub-8 float32 remainder (regression). A float32
 // segment/channel stride lies on the 4-float (16-byte) grid, so a range whose length
 // ≡ 4 (mod 8) leaves a trailing 4-element tail after the 8-lane groups. The AVX2
 // float32 kernels DotF32Avx2/L2F32Avx2 AND their scalar mirrors DotF32ScalarAvx2/
@@ -1315,7 +1315,7 @@ static void TestAvx2Sub8RemainderF32()
 		CHECK(ValidateBank(view) == Status::Ok);
 
 		// Query, with the first channel's sub-vector renormalized to unit norm (the
-		// D-V2-1 per-channel build rule the fixture in TestPerChannelCosine also uses).
+		// per-channel build rule the fixture in TestPerChannelCosine also uses).
 		AlignedBuf q(static_cast<size_t>(pd) * sizeof(float));
 		std::vector<float> qv(static_cast<size_t>(dims));
 		for (auto& x : qv)
@@ -2631,7 +2631,7 @@ static void TestSegmentedScan()
 
 
 // ---------------------------------------------------------------------------
-// T21 — per-channel cosine (V2 plan section 5, D-V2-1; slot 2):
+// T21 — per-channel cosine (V2 plan section 5; slot 2):
 //   channel-matched segments on a channel-carrying Cosine bank score as TRUE
 //   per-channel cosines via inverse sub-norms baked from the QUANTIZED rows;
 //   zero-norm row channels score 0 (never NaN); decomposition contributions
@@ -2662,7 +2662,7 @@ static void TestPerChannelCosine()
 		view.channelInvNorms = invNorms.data();
 		CHECK(ValidateBank(view) == Status::Ok);
 
-		// Query with per-channel-renormalized sub-vectors (the D-V2-1 build rule).
+		// Query with per-channel-renormalized sub-vectors (the per-channel build rule).
 		AlignedBuf q(static_cast<size_t>(pd) * sizeof(float));
 		std::vector<float> qv(static_cast<size_t>(dims));
 		for (auto& x : qv)
@@ -3460,7 +3460,7 @@ static void TestScratchBanks()
 				}
 			}
 
-			// Grow preserves indices (T-044 W4): same hits, same scores, then room
+			// Grow preserves indices: same hits, same scores, then room
 			// for more rows.
 			{
 				BankView preGrow;
@@ -5209,7 +5209,7 @@ static void TestScratchRetention()
 		zero.bytes[4] = 0;
 		CHECK(loaded.Load(zero.Reader()) == Status::BadFormat);
 
-		// Absurd geometry (review M2, the T-062 idiom): a crafted header with an
+		// Absurd geometry (review M2, the trust-boundary idiom): a crafted header with an
 		// unbounded capacity is BadFormat BEFORE any byte-size arithmetic — a
 		// hard format rejection, not an allocator outcome.
 		MemArchive huge;
@@ -6711,7 +6711,7 @@ static void TestPoolRecallAndContracts()
 		// silently wrong. The contract is a FINITE non-negative scale and a
 		// self-dot that IS the image's — anything else is InvalidArgument, single
 		// and batch alike. The honest pipeline never emits these; a hand-edited or
-		// corrupted payload is the threat model (the T-062 class).
+		// corrupted payload is the threat model (the trust-boundary class).
 		{
 			const int64_t honestSq = xq.sqSum;
 			const double inf = std::numeric_limits<double>::infinity();
@@ -8124,7 +8124,7 @@ static void TestBankAnalytics()
 		}
 	}
 
-	// --- T-V2.5-11 the -128 boundary guard at public ScoreXdPair (D-V2-13) ---
+	// --- T-V2.5-11 the -128 boundary guard at public ScoreXdPair ---
 	{
 		const int32_t pd = 16;
 		AlignedBuf img(static_cast<size_t>(pd));
@@ -9134,7 +9134,7 @@ static void TestScratchChannelFeatureOracle()
 				}
 				else // Cosine: dot(query_sub, row_sub) / ||row_sub|| -- the
 					 // SUB-VECTOR norm of the (whole-row-unit-normalized) row,
-					 // never the whole-row norm (the exact D-V2-1 contract
+					 // never the whole-row norm (the exact per-channel cosine contract
 					 // point a wrong-but-deterministic implementation could
 					 // get backwards).
 				{
@@ -9685,7 +9685,7 @@ static void TestScratchChannelLifetimeShapeContracts()
 			static_cast<unsigned long long>(AllocationCount()));
 	}
 
-	// Grow preserves the sub-norm arena (parity with T-044 W4 index
+	// Grow preserves the sub-norm arena (parity with Grow's index
 	// preservation, extended to the sub-norm array): original rows' per-
 	// channel sub-norms are bit-unchanged after Grow.
 	{
@@ -9910,7 +9910,7 @@ namespace
 	// sorted reference hits for one channel. NEVER calls ComputeChannelInverseNorms or the
 	// kernel -- it computes the per-channel cosine as dot(q_sub, row_sub)/||row_sub|| from
 	// the dequantized rows directly (the sub-vector norm, not the whole-row norm -- the
-	// D-V2-1 contract point).
+	// per-channel cosine contract point).
 	struct FeatRefHit
 	{
 		int32_t index;
@@ -13634,7 +13634,7 @@ static void TestRelabelHeldViewAliasing()
 }
 
 // T-V3.1-Storm (dim 3) -- the exclusive-drain harness. Relabel is an EXCLUSIVE writer op,
-// the same class as Grow/Load (S24.4, D-V3.1-1): it frees the old arena and rebinds, so a
+// the same class as Grow/Load (S24.4): it frees the old arena and rebinds, so a
 // concurrent unpinned Snapshot's channelInvNorms would dangle into freed memory. The host
 // drives the drain: the writer wraps each Relabel in BeginExclusive/EndExclusive (new pins
 // refused, in-flight pins waited to zero); the reader holds a pin across Snapshot AND the
@@ -19921,11 +19921,11 @@ static void BuildRowQueries(const BankView& bank, int32_t count,
 // CORRECTION (2026-08-06): an earlier revision of this suite scoped
 // Metric::L2 out of every SelectDiverseMMR-level cell, on the reasoning that
 // the plan's signature carried no parameter for L2's bank-intrinsic scale L
-// (filed as case-file gap G-CORE-1, decision D-SLM1288). That reading was
+// (filed as case-file gap G-CORE-1). That reading was
 // against a stale copy of the plan; the current text specifies a `float
 // l2Scale` parameter (section 6.2's signature block) -- the caller-computed,
 // caller-cached L, read only when `metric == Metric::L2` and ignored
-// otherwise. D-SLM1288 is corrected in place in the decision log rather than
+// otherwise. That gap record is corrected in place rather than
 // deleted; Metric::L2 is fully exercised below, including a dedicated crux
 // cell for section 12 dim 7's "half-applied transform" mutant (an
 // implementation that transforms one of relevance/redundancy and leaves the
@@ -20009,7 +20009,7 @@ static double RefSegmentedL2Raw(const int8_t* a, const int8_t* b, double aScale,
 	return total;
 }
 
-// Per-range TRUE cosine (convention (ii), D-INSP-57's adopted closed form): a
+// Per-range TRUE cosine (convention (ii), the adopted closed form): a
 // live range whose per-range self-dot is zero on either operand floors that
 // range's cos_s to 0 (the same "zero sub-vector scores a defined 0" reading
 // XdChannelPairScore already establishes for this codebase's channel-scoped
@@ -20047,22 +20047,22 @@ static double RefSegmentedCosineRaw(const int8_t* a, const int8_t* b,
 }
 
 // Isolates a single call to ScoreXdPairSegmented so a null-pointer access
-// violation (D-SLM1311, section 6.2's "segmentCount == 0 (or segments ==
+// violation (section 6.2's "segmentCount == 0 (or segments ==
 // nullptr)" degenerate case) is caught as a failing CHECK rather than
-// crashing the whole suite and losing every result after it. D-SLM1311 and
-// D-SLM1343 are both fixed and mutation-proven at this file's current
+// crashing the whole suite and losing every result after it. Both defects
+// are fixed and mutation-proven at this file's current
 // revision (analytics.cpp:217, :242) -- this comment block, and the fixture
 // below, describe the regression this probe guards against, not a live
 // defect. Two backends give the guard the identical portable contract on
 // every job this project's own CI runs (.github/workflows/tests.yml:
 // windows-x64, linux-x64, linux-x64-tsan, macos-arm64) -- SEH on MSVC,
 // POSIX signal + sigsetjmp/siglongjmp elsewhere (system includes live at
-// file scope, D-SLM1351). A prior revision of this probe existed only under
+// file scope). A prior revision of this probe existed only under
 // `#if defined(_MSC_VER)`, with the CALL ITSELF also gated behind that same
 // macro -- so on every non-MSVC job the whole cell contributed zero checks,
-// and the CMake path this project's own CI (and, per D-SLM1299/F-3, this
+// and the CMake path this project's own CI (and, per F-3, this
 // entire branch's *only* linkable path) uses carried the regression guard
-// nowhere at all (D-SLM1343, since fixed): the reviewer reintroduced the
+// nowhere at all (since fixed): the reviewer reintroduced the
 // fall-through and rebuilt, MSVC caught it, g++ 15.2.0 reported 83274
 // checks, 0 failures, exit 0 -- a clean green over the access-violation
 // defect. Corrected: the call and its assertions (below) now run
@@ -20152,7 +20152,7 @@ static bool ProbeScoreXdPairSegmentedNoCrash(
 }
 #endif
 
-// --- dim 2 (D-SLM1311, the code reviewer F-1, Critical, fixed and mutation-proven --
+// --- dim 2 (the code reviewer F-1, Critical, fixed and mutation-proven --
 // see this cell's own crash-isolation probe above): section 6.2 states the
 // degenerate full-row path is selected by "segmentCount == 0 (or segments ==
 // nullptr)" -- an OR of two independent conditions, so a null `segments`
@@ -20174,7 +20174,7 @@ static void TestScoreXdPairSegmentedNullSegmentsPositiveCountIsLegal()
 {
 	std::printf(
 		"ScoreXdPairSegmented: segments==nullptr, segmentCount>0 -- legal, degenerate "
-		"(section 6.2, D-SLM1311)\n");
+		"(section 6.2)\n");
 	Rng rng(0x5EC5EC5E);
 	const int32_t paddedDims = 64;
 	std::vector<int8_t> imgA, imgB;
@@ -20192,7 +20192,7 @@ static void TestScoreXdPairSegmentedNullSegmentsPositiveCountIsLegal()
 	CHECK_MSG(completed,
 		"ScoreXdPairSegmented(segments=nullptr, segmentCount=3) crashed (access violation / "
 		"SIGSEGV/SIGBUS) -- section 6.2 requires this input to take the degenerate full-row path, "
-		"bit-identical to ScoreXdPair, not dereference a null pointer (D-SLM1311, Critical)");
+		"bit-identical to ScoreXdPair, not dereference a null pointer (Critical)");
 	if (completed)
 	{
 		CHECK_MSG(segSt == Status::Ok, "null-segments, segmentCount=3: status %d != Ok",
@@ -20203,7 +20203,7 @@ static void TestScoreXdPairSegmentedNullSegmentsPositiveCountIsLegal()
 	}
 }
 
-// --- dim 8 (section 12 dim 8's own text, D-SLM1315 folding D-SLM1312, fixed
+// --- dim 8 (section 12 dim 8's own text, fixed
 // and mutation-proven -- analytics.cpp:242): the local validator's weight
 // law is "finite and non-negative" (widened from "finite" alone) -- the
 // THIRD deliberate departure from ValidateSegments (matching
@@ -20224,8 +20224,8 @@ static void TestScoreXdPairSegmentedNullSegmentsPositiveCountIsLegal()
 static void TestScoreXdPairSegmentedNegativeWeightRefusal()
 {
 	std::printf(
-		"ScoreXdPairSegmented: negative segment weight refused, Cosine/L2 (section 12 dim 8, "
-		"D-SLM1315)\n");
+		"ScoreXdPairSegmented: negative segment weight refused, Cosine/L2 (section 12 dim 8"
+		")\n");
 
 	// --- The required assertion: a generic fixture, one negative finite
 	// weight, otherwise well-formed (grid-aligned, ascending, non-
@@ -20248,7 +20248,7 @@ static void TestScoreXdPairSegmentedNegativeWeightRefusal()
 			const Status st = ScoreXdPairSegmented(a, b, paddedDims, metrics[m], segs, 2, &out);
 			CHECK_MSG(st == Status::InvalidArgument,
 				"%s: negative segment weight must be InvalidArgument, got status %d (a defined "
-				"value, %.9g, not a refusal) (section 12 dim 8, D-SLM1315)",
+				"value, %.9g, not a refusal) (section 12 dim 8)",
 				names[m], static_cast<int>(st), static_cast<double>(out));
 		}
 	}
@@ -20283,7 +20283,7 @@ static void TestScoreXdPairSegmentedNegativeWeightRefusal()
 		const Status st = ScoreXdPairSegmented(a, b, paddedDims, Metric::Cosine, segs, 2, &out);
 		CHECK_MSG(st == Status::InvalidArgument,
 			"cosine, exact-cancellation fixture: negative weight must be InvalidArgument, got "
-			"status %d (executed pre-fix disposition: %s) (section 12 dim 8, D-SLM1315)",
+			"status %d (executed pre-fix disposition: %s) (section 12 dim 8)",
 			static_cast<int>(st),
 			st == Status::ZeroNormQuery
 				? "the predicted spurious Status::ZeroNormQuery on a nonzero-norm payload"
@@ -20312,7 +20312,7 @@ static void TestScoreXdPairSegmentedNegativeWeightRefusal()
 		const Status st = ScoreXdPairSegmented(a, b, paddedDims, Metric::L2, segs, 1, &out);
 		CHECK_MSG(st == Status::InvalidArgument,
 			"L2, whole-row-negative-weight fixture: negative weight must be InvalidArgument, got "
-			"status %d, raw value %.9g (%s) (section 12 dim 8, D-SLM1315)",
+			"status %d, raw value %.9g (%s) (section 12 dim 8)",
 			static_cast<int>(st), static_cast<double>(out),
 			(st == Status::Ok && out < 0.0f)
 				? "executed: a negative raw total under Status::Ok -- sqrt of this in "
@@ -20545,8 +20545,8 @@ static void TestScoreXdPairSegmentedLocalValidator()
 // paddedDims, weight finiteness) -- excluding the properties that do not
 // transfer: ValidateSegments' count lower bound of 1 and its separate
 // per-segment zero-sub-norm trigger (both named in section 6.2 as deliberate
-// departures), AND weight SIGN (D-SLM1315, folding D-SLM1312, corrected here
-// -- D-SLM1342): the local validator additionally rejects `seg.weight < 0`,
+// departures), AND weight SIGN:
+// the local validator additionally rejects `seg.weight < 0`,
 // which `ValidateSegments`'s own finiteness-only check (`src/validate.cpp:
 // 148`) does not. Weight sign is a documented THIRD divergence, not a
 // shared rule -- it must never be run through the `agree()` predicate below
@@ -20595,7 +20595,7 @@ static void TestScoreXdPairSegmentedValidatorAgreement()
 		agree(s, 1, "non-finite weight"); }
 	{ const QuerySegment s[2] = {{0, 16, 1.0f}, {32, 16, 1.0f}}; agree(s, 2, "well-formed"); }
 
-	// --- The documented THIRD divergence (D-SLM1315, weight sign), asserted
+	// --- The documented THIRD divergence (weight sign), asserted
 	// explicitly as a divergence -- NOT run through agree(), which would
 	// wrongly assert the two validators still reach the same verdict here.
 	// ValidateSegments' own finiteness-only check accepts a negative,
@@ -20615,7 +20615,7 @@ static void TestScoreXdPairSegmentedValidatorAgreement()
 			static_cast<int>(vs));
 		CHECK_MSG(local == Status::InvalidArgument,
 			"negative-weight divergence fixture: the local validator must refuse it -- got status "
-			"%d (D-SLM1315's own refusal, section 12 dim 8, tested directly by "
+			"%d (the weight-sign refusal, section 12 dim 8, tested directly by "
 			"TestScoreXdPairSegmentedNegativeWeightRefusal; this cell additionally proves "
 			"ValidateSegments does NOT share it)",
 			static_cast<int>(local));
@@ -20793,7 +20793,7 @@ static void TestScoreXdPairSegmentedSegmentCountExtremes()
 	}
 }
 
-// --- dim 7 (D-INSP-57): the adopted combine (convention (ii), the S-C form)
+// --- dim 7: the adopted combine (convention (ii), the S-C form)
 // is degree-1 homogeneous in the weight vector -- scaling every weight by a
 // positive constant k scales the raw output by exactly k. Convention (i)
 // (rejected, section 6.2) is degree-0 and would fail this cell outright;
@@ -20801,7 +20801,7 @@ static void TestScoreXdPairSegmentedSegmentCountExtremes()
 static void TestScoreXdPairSegmentedCosineHomogeneity()
 {
 	std::printf(
-		"ScoreXdPairSegmented: Cosine raw combine is degree-1 homogeneous (dim 7, D-INSP-57)\n");
+		"ScoreXdPairSegmented: Cosine raw combine is degree-1 homogeneous (dim 7)\n");
 	const int32_t paddedDims = 48;
 	Rng rng(0xF00D5EED);
 	std::vector<int8_t> imgA, imgB;
@@ -20869,7 +20869,7 @@ static void TestAllocFlatAnalyticsSegmentedPair()
 // computed, caller-cached bank-intrinsic scale (section 6.2's `l2Scale`
 // parameter). For Dot/Cosine, `relevance`/`redundancy` are the raw
 // (untransformed, or Cosine-recovered) operands, unchanged from before this
-// fold. For L2 (T-1828, D-SLM1787/1788): `f(x) = 1 - sqrt(x)/L` is
+// fold. For L2: `f(x) = 1 - sqrt(x)/L` is
 // materialized in `long double`, not `float32`, and the full spec formula
 // `lambda * relevance - (1 - lambda) * redundancy` is evaluated at that same
 // precision -- an INDEPENDENT construction from src/diversity.cpp's own
@@ -20880,8 +20880,7 @@ static void TestAllocFlatAnalyticsSegmentedPair()
 // toolchain in this suite's matrix, equal to double's only on MSVC) keeps
 // the ~1e-8-scale `u` separations the fourth adversarial strike measured
 // representable after the subtraction, unlike this oracle's own pre-fold
-// `float32` materialization, which collided on exactly that geometry
-// (D-SLM1788).
+// `float32` materialization, which collided on exactly that geometry.
 static Status RefSelectDiverseMMR(
 	const Hit* candidates, const XdQuery* candidateQueries, int32_t candidateCount,
 	int32_t paddedDims, Metric metric, float lambda, int32_t k,
@@ -21199,7 +21198,7 @@ static void TestDiversityMMR()
 			CHECK(redA == redB);
 		}
 
-		// --- Channel-weight axis (dim 4, D-INSP-55/57/58): non-default
+		// --- Channel-weight axis (dim 4): non-default
 		// weights, sum(weight_s) != 1 -- cross-checked against
 		// RefSelectDiverseMMR's own weighted transform (Cosine's
 		// sum(weight_s) - x recovery; Dot's identity; L2's f(x) applied to
@@ -21235,7 +21234,7 @@ static void TestDiversityMMR()
 				}
 
 				// --- Argmax invariance under a uniform weight rescale (dim 7,
-				// corrected 2026-08-06 -- D-SLM1298 confirmed a real
+				// corrected 2026-08-06 -- review confirmed a real
 				// construction defect here, not a spec/build mismatch; see
 				// the case file for the correction record). Section 6.2's own
 				// derivation ("The structurally sound repair," `x_rel(pos) =
@@ -21283,7 +21282,7 @@ static void TestDiversityMMR()
 		}
 	}
 
-	// --- Compression-region L2 cross-check (T-1828, D-SLM1787/1788): four candidates
+	// --- Compression-region L2 cross-check: four candidates
 	// whose pre-transform ratios sit 4e-8 apart at u ~ 0.1 -- the fourth adversarial
 	// strike's own onset measurement (the development records: resolution loss onsets at
 	// u = 0.706631 and grows below it) -- with Hit.index DESCENDING so a float32(1-u)
@@ -21293,7 +21292,7 @@ static void TestDiversityMMR()
 	// Better(..., Metric::L2) order (ascending raw distance) selects pos 0 first at every
 	// lambda > 0. This is the cell the pre-b74d182 `Metric::L2` construction cannot pass:
 	// reverting src/diversity.cpp's ranking key to that construction (the mutation
-	// D-SLM1787 records as unguarded before this fold) resolves the pos-0/pos-1
+	// recorded as unguarded before this fold) resolves the pos-0/pos-1
 	// `float32(1-u)` collision on ascending Hit.index and selects pos 1 (index 20) first
 	// instead of pos 0 (index 30).
 	{
@@ -21428,7 +21427,7 @@ static void TestDiversityMMR()
 			"ZeroNormQuery", static_cast<int>(st));
 	}
 
-	// --- The crux (dim 7, D-INSP-47): the corrected Cosine redundancy term selects
+	// --- The crux (dim 7): the corrected Cosine redundancy term selects
 	// the diverse candidate over a near-duplicate at lambda=0.5, equal relevance --
 	// the shipped kernel (subtracting ScoreXdPair's raw 1-cos output unchanged)
 	// selects the duplicate instead (the polarity inversion the test author's oracle
@@ -21467,7 +21466,7 @@ static void TestDiversityMMR()
 		CHECK(red[0] == 0.0f);
 		CHECK_MSG(sel[1] == 2,
 			"crux fixture: step 1 must pick the DIVERSE candidate (pos 2), not the near-duplicate "
-			"(pos 1) -- got pos %d (this is the D-INSP-47 polarity-inversion cell)", sel[1]);
+			"(pos 1) -- got pos %d (this is the polarity-inversion cell)", sel[1]);
 	}
 
 	// --- The L2 crux (section 12 dim 7's third mutant, section 6.2): a build
@@ -21529,9 +21528,9 @@ static void TestDiversityMMR()
 			sel[1]);
 	}
 
-	// --- Subnormal display floor, Metric::Dot (N-1, D-SLM1798): the header states both
+	// --- Subnormal display floor, Metric::Dot (N-1): the header states both
 	// display outputs are floored uniformly for every metric -- float32, with
-	// |value| < FLT_MIN flushed to exactly 0.0f (D-SLM1779). Metric::Dot's relevance
+	// |value| < FLT_MIN flushed to exactly 0.0f. Metric::Dot's relevance
 	// display is candidates[pos].score passed straight through XdFloorDiversityLocal
 	// (src/diversity.cpp), so a subnormal Hit.score pins that promise directly: an
 	// implementation that skips the floor on this display path fails this cell.
@@ -21550,7 +21549,7 @@ static void TestDiversityMMR()
 			nullptr, 0, 0.0f, MmrScratch(1), sel.data(), rel.data(), red.data()) == Status::Ok);
 		CHECK_MSG(rel[0] == 0.0f,
 			"Dot subnormal display floor: relevance %.9g != 0 (Hit.score %.9g is subnormal and "
-			"must flush to exactly 0.0f per the header's D-SLM1779 floor promise)",
+			"must flush to exactly 0.0f per the header's floor promise)",
 			static_cast<double>(rel[0]), static_cast<double>(candidates[0].score));
 	}
 }

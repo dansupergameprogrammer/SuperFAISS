@@ -52,7 +52,7 @@ Status ScoreXdPair(const XdQuery& a, const XdQuery& b, int32_t paddedDims, Metri
 // similarity; L2/Cosine distance), weighted per resolved live range: total =
 // sum(weight_s * partial_s), each partial the same fixed-order double epilogue
 // ScoreXdPair's XdDot/XdL2 use (Dot/L2), or the true per-range cosine
-// `1 - cross_s/sqrt(aSq_s*bSq_s)` for Cosine (convention (ii), the D-INSP-57 adopted closed
+// `1 - cross_s/sqrt(aSq_s*bSq_s)` for Cosine (convention (ii), the adopted closed
 // form) -- summed in ascending-offset range order, ending in the same subnormal floor. The
 // resolved-range working array is sized `2*kMaxSegments + 1`, never `kMaxSegments` (the same
 // worst-case bound BuildScanRanges documents: a gap range interleaves before every named
@@ -63,7 +63,7 @@ Status ScoreXdPair(const XdQuery& a, const XdQuery& b, int32_t paddedDims, Metri
 // `segments`/`segmentCount == 0` OR `segments == nullptr` -- TWO INDEPENDENT triggers,
 // either one alone -- scores the single implicit full-row segment `(0, paddedDims, 1.0)`,
 // bit-identical to `ScoreXdPair(a, b, paddedDims, metric, outScore)`. A null `segments` with
-// a positive `segmentCount` is legal input that also takes this path (D-SLM1311): it is
+// a positive `segmentCount` is legal input that also takes this path: it is
 // never dereferenced.
 //
 // Validates locally, not via `ValidateSegments` (which takes a `BankView`/`paddedQuery`
@@ -72,7 +72,7 @@ Status ScoreXdPair(const XdQuery& a, const XdQuery& b, int32_t paddedDims, Metri
 // no `-128` element, each payload's own `sqSum` matched by a fresh self-dot recompute), plus
 // the structural segment-list rules `ValidateSegments` enforces on a segment list: offsets
 // and lengths positive, on the 16-byte int8-quantization element grid, ascending and
-// non-overlapping, ending within `paddedDims`, weights finite AND NON-NEGATIVE (D-SLM1315).
+// non-overlapping, ending within `paddedDims`, weights finite AND NON-NEGATIVE.
 // `InvalidArgument` on any violation. Three deliberate departures from `ValidateSegments`:
 // `segmentCount` is accepted over `[0, kMaxSegments]` (the widened lower bound of `0` is the
 // degenerate path above, versus `ValidateSegments`' `[1, kMaxSegments]`); `Metric::Cosine`
@@ -126,7 +126,7 @@ Status MaxNNCrossDevice(
 	XdQuery* queryScratch, Hit* hitScratch, int32_t* countScratch, Workspace& ws,
 	float* outValue);
 
-// Within-bank dispersion (plan 22.4, spread = centroid-dispersion, D-V2-11): the mean (or
+// Within-bank dispersion (plan 22.4, spread = centroid-dispersion): the mean (or
 // max) distance of each selected row to the selection's own MakeCentroidCrossDevice
 // centroid, in the bank's metric. Reduction order and floor as MeanNN/MaxNN.
 // `rowIndices`/`rowCount` are the rows to include (ascending for the pinned mean order);

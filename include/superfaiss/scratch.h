@@ -26,7 +26,7 @@ namespace superfaiss
 //   - Grow and Load are EXCLUSIVE: no readers, no other writer. The core documents
 //     the precondition; a host's pin mechanism is what enforces it in practice.
 //
-// Index stability is the consumer contract (T-044 W4): Grow preserves row indices —
+// Index stability is the consumer contract: Grow preserves row indices —
 // it copies rows and tombstones and never compacts; a saved index means the same row
 // before and after. Freeze() renumbers (compaction drops tombstoned rows) and returns
 // the old->new map so consumers remap stored handles as part of the freeze.
@@ -178,11 +178,11 @@ public:
 	// capacity budget is exhausted — Grow() to proceed.
 	Status Append(const float* row, int32_t dims, int32_t* outIndex);
 
-	// Sets the row's tombstone bit atomically (T-044 W5: fetch_or — a plain bitset
+	// Sets the row's tombstone bit atomically (fetch_or — a plain bitset
 	// write concurrent with snapshot reads is a C++ data race). Idempotent.
 	Status Remove(int32_t index);
 
-	// Index-preserving reallocation (T-044 W4). EXCLUSIVE: no readers, no snapshots
+	// Index-preserving reallocation. EXCLUSIVE: no readers, no snapshots
 	// in flight — a host waits on its pin counter before calling. newCapacity must
 	// exceed the current capacity.
 	Status Grow(int32_t newCapacity);
@@ -214,7 +214,7 @@ public:
 
 	// --- Reader-pin / exclusive-drain protocol ---
 	//
-	// The dispatch gate hosts put in front of Grow/Load (T-044 N4): readers pin
+	// The dispatch gate hosts put in front of Grow/Load: readers pin
 	// for a query flight; an exclusive operation raises the drain flag (new pins
 	// refused), waits the pins out, runs, releases. The critical pairs - the
 	// exclusive side's flag-store + pin-count-load, and the reader side's
@@ -388,7 +388,7 @@ public:
 	// --- Persistence (archive seam) ---
 
 	// Writes the full state (header, rows, scales, tombstones). Runs as the writer,
-	// under the single-writer guard (T-044 N1).
+	// under the single-writer guard.
 	Status Save(const ScratchArchive& archive) const;
 
 	// Recreates the bank from an archive. EXCLUSIVE — no readers, no writer; an

@@ -100,7 +100,7 @@ jobs:
 
   # ThreadSanitizer over the whole suite — the scratch-bank storm test (T-V2-C1)
   # is the target: single-writer/lock-free-reader races surface here, not on
-  # x86's forgiving memory model (T-044 W5).
+  # x86's forgiving memory model.
   linux-x64-tsan:
     needs: changes
     runs-on: ubuntu-latest
