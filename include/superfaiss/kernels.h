@@ -17,7 +17,7 @@ namespace superfaiss
 // v2.1 dense row bias: when `rowBias` is non-null (bank.count floats), each row's
 // composed score is score + rowBias[r] - ONE fused add after dequantized scoring,
 // before top-k insertion; a non-finite bias value sets *outNonFiniteBias (callers
-// return NonFiniteQuery at completion - the fused-validation law, T-055 W2). Null
+// return NonFiniteQuery at completion - the fused-validation law). Null
 // rowBias executes no add: the bit-identical unbiased path. Same trailing pair on
 // every chunk kernel below (ScoreChunkPair takes one per query; the fused kernels
 // apply bias once, to the fused score).

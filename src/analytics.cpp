@@ -105,7 +105,7 @@ inline int32_t BuildSegPairRanges(const QuerySegment* segments, int32_t segmentC
 
 // True if any image element is INT8_MIN (-128). The ±127 premise the int32 cross-dot
 // bound rests on (plan W1) admits only [-127, 127]; a -128 element at paddedDims near the
-// ceiling overflows the int32 accumulator (D-V2-13). Checked at the public boundary before
+// ceiling overflows the int32 accumulator. Checked at the public boundary before
 // any accumulation - the self-dot recompute below would itself overflow on such a payload.
 inline bool HasMinInt8(const int8_t* image, int32_t n)
 {
@@ -161,7 +161,7 @@ Status ScoreXdPair(const XdQuery& a, const XdQuery& b, int32_t paddedDims, Metri
 	{
 		return Status::InvalidArgument;
 	}
-	// -128 guard (D-V2-13): enforce the +-127 premise before any int32 accumulation.
+	// -128 guard: enforce the +-127 premise before any int32 accumulation.
 	if (HasMinInt8(a.q8, paddedDims) || HasMinInt8(b.q8, paddedDims))
 	{
 		return Status::InvalidArgument;
@@ -210,7 +210,7 @@ Status ScoreXdPairSegmented(const XdQuery& a, const XdQuery& b, int32_t paddedDi
 
 	// The degenerate full-row path (this function's doc comment, section 6.2): TWO
 	// independent triggers -- segmentCount == 0, OR segments == nullptr -- either one alone
-	// selects it (D-SLM1311: a null `segments` with a positive `segmentCount` is legal input
+	// selects it (a null `segments` with a positive `segmentCount` is legal input
 	// that must also take this path, not fall through to a null-pointer dereference in the
 	// structural-validation loop below). Bit-identical to ScoreXdPair -- reuses the same
 	// internal XdPairScore helper and the same whole-row Cosine zero-norm trigger.
@@ -228,8 +228,8 @@ Status ScoreXdPairSegmented(const XdQuery& a, const XdQuery& b, int32_t paddedDi
 	// 1 and the separate per-segment zero-sub-norm trigger, plus one departure ValidateSegments
 	// does NOT carry -- all three named departures, this function's own doc comment):
 	// offsets/lengths positive, on the 16-byte int8-quantization element grid, ascending and
-	// non-overlapping, ending within paddedDims, weights finite AND non-negative (D-SLM1315,
-	// folding D-SLM1312: a negative weight is not merely unneeded by the per-metric combine
+	// non-overlapping, ending within paddedDims, weights finite AND non-negative (
+	// a negative weight is not merely unneeded by the per-metric combine
 	// below -- it breaks it, cancelling Cosine's weighted self-norm to a spurious
 	// Status::ZeroNormQuery on a nonzero-norm payload, or driving L2's raw total negative, a
 	// downstream sqrt of which is NaN under Status::Ok. ValidateSegments (src/validate.cpp)
@@ -304,7 +304,7 @@ Status ScoreXdPairSegmented(const XdQuery& a, const XdQuery& b, int32_t paddedDi
 		return Status::Ok;
 	}
 
-	// Metric::Cosine -- convention (ii), the D-INSP-57 adopted closed form: each range's own
+	// Metric::Cosine -- convention (ii), the adopted closed form: each range's own
 	// TRUE per-range cosine, weighted and summed as a distance (1 - cos_s). A live range
 	// whose per-range self-dot is zero on either operand floors that range's cos_s to 0 (the
 	// same "zero sub-vector scores a defined 0" reading XdChannelPairScore already

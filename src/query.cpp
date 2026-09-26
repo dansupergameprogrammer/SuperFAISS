@@ -11,7 +11,7 @@ namespace superfaiss
 
 namespace
 {
-	// Pre-quantized payload integrity (v2.4 review S2/M1 — the T-062 trust-boundary
+	// Pre-quantized payload integrity (v2.4 review S2/M1 — the trust-boundary
 	// class): no field of a caller-provided XdQuery may make scores or rankings
 	// ill-defined or silently wrong. The scale must be FINITE and non-negative —
 	// the bare `>= 0.0` test admits +inf, which poisons Dot/L2 scores with NaN and
@@ -35,7 +35,7 @@ namespace
 		return sq == query.sqSum;
 	}
 
-	// Weight folding (T-050 W1 bench clause, taken and recorded in plan section 10):
+	// Weight folding (the bench clause, taken and recorded in plan section 10):
 	// for dot-family scoring, sum_s w_s * sum_{j in s} r_j q_j == sum_j r_j (w(j) q_j)
 	// exactly, so segmented dot/cosine scans fold the segment weights into a query
 	// copy once (gaps and weight-0 segments fold to 0, preserving omission

@@ -658,7 +658,7 @@ namespace
 {
 	// v2.1 dense bias composition: ONE fused add after dequantized scoring, before
 	// top-k insertion; a non-finite bias value raises the caller's flag (fused
-	// validation, T-055 W2) - the scan completes and the caller returns
+	// validation) - the scan completes and the caller returns
 	// NonFiniteQuery. Null bias executes no add: the bit-identical unbiased path.
 	inline float ComposeBias(float score, const float* rowBias, int32_t r, bool* flag)
 	{
@@ -896,7 +896,7 @@ void ScoreChunkFused(
 
 namespace
 {
-	// The dense segmented scan (V2 plan section 10 decision, T-050-corrected):
+	// The dense segmented scan (V2 plan section 10 decision, as corrected):
 	// one contiguous pass over the whole row - gaps between and after segments are
 	// scored into a discarded partial so reads stay sequential and the prefetcher
 	// never sees a stride - with per-segment partials produced by the SAME per-row
@@ -1009,7 +1009,7 @@ namespace
 	// the return value is the weighted combine.
 	// rowInvNorms: per-channel-cosine banks pass the row's inverse sub-norm slice
 	// (channelCount floats); a channel-matched range's partial scales by its stored
-	// inverse sub-norm BEFORE the weight (D-V2-1: true per-channel cosine; a
+	// inverse sub-norm BEFORE the weight (true per-channel cosine; a
 	// zero-norm row channel stored 0 and scores 0 - defined, never NaN).
 	// outPartials receives the post-scale, post-weight per-segment contributions
 	// (the decomposition surface: contributions sum bit-exactly to the total).
@@ -1058,7 +1058,7 @@ namespace
 				total += contribution;
 			}
 			// Gap partials are computed for stride continuity and discarded; their
-			// products never touch a live score (T-050 W1 discard semantics).
+			// products never touch a live score (discard semantics).
 		}
 		return total;
 	}

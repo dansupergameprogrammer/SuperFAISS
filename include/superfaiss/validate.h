@@ -37,7 +37,7 @@ Status ValidateSegments(
 // seenBits is caller scratch, ceil(count/32) zeroed uint32 words; on return the pair
 // rows' bits are set (callers reuse them to detect pair rows among scan candidates).
 // Dense bias is NOT pre-validated - its non-finite check fuses into the scan
-// (T-055 W2; a pre-pass would re-read count x 4 bytes and eat the int8 budget).
+// (a pre-pass would re-read count x 4 bytes and eat the int8 budget).
 Status ValidateBiasPairs(
 	const BankView& bank,
 	const BiasPair* pairs,

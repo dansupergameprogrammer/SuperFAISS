@@ -642,11 +642,11 @@ class ScratchBank {              // single writer, lock-free readers
     Status Freeze(void* outRows, float* outScales, int32_t* outIndexMap,   // v3.0 channel-aware:
                   float* outChannelInvNorms, ScratchRecallReport* = nullptr,//   sub-norms re-derived
                   Workspace* = nullptr, uint64_t = kDefaultRecallSeed) const;//  over compacted rows
-    Status FreezeWithRecall(void* outRows, float* outScales, int32_t* outIndexMap, // v3.0 (D-V3-7)
+    Status FreezeWithRecall(void* outRows, float* outScales, int32_t* outIndexMap, // v3.0
                   float* outChannelInvNorms, ScratchRecallReport* outRecallReports, //  per-channel
                   int32_t reportCount, Workspace&, uint64_t = kDefaultRecallSeed) const;
     int32_t GetChannelCount() const;  const ChannelInfo* GetChannels() const;       // v3.0 table read-back
-    Status MeasureScratchRecallPerChannel(Workspace&, ScratchRecallReport* outReports, // v3.0 (D-V3-7)
+    Status MeasureScratchRecallPerChannel(Workspace&, ScratchRecallReport* outReports, // v3.0
                   int32_t reportCount, uint64_t seed = kDefaultRecallSeed);          //   recall@k per channel
     Status Save(const ScratchArchive&) const;     // writer-side
     Status Load(const ScratchArchive&, const Allocator& = ...); // EXCLUSIVE

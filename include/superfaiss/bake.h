@@ -43,7 +43,7 @@ void PadRowsFloat32(
 // header-derived sizes must never enter byte arithmetic unbounded.
 Status ValidateSourceRows(const float* rows, int32_t count, int32_t dims, int32_t* outBadRow);
 
-// Per-channel inverse row norms for Cosine banks carrying channels (D-V2-1): baked
+// Per-channel inverse row norms for Cosine banks carrying channels: baked
 // from the bank's QUANTIZED payload - the reported per-channel cosine is the cosine
 // of what the kernel dots, not of the pre-quantization source. outInvNorms holds
 // bank.count x bank.channelCount floats, row-major. A zero-norm row channel stores 0.

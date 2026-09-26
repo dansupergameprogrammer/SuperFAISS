@@ -50,7 +50,7 @@ namespace superfaiss
 // widget's own Metric::L2 compute path is the plan's chosen enforcement point for this
 // precondition too; not re-checked here.
 //
-// The redundancy term, per metric (drift-and-diversity plan section 6.2, D-INSP-47/57/50/53).
+// The redundancy term, per metric (drift-and-diversity plan section 6.2).
 // For Dot and Cosine, each selection step argmaxes `lambda * relevance - (1 - lambda) *
 // redundancy` directly, where `relevance` is `candidates[pos].score` and `redundancy` is the
 // mean (double accumulation over already-selected members in selection order, then one
@@ -60,11 +60,11 @@ namespace superfaiss
 //             similarity, on the same scale as candidates[pos].score).
 //   - Cosine: `sum(weight_s) - ScoreXdPairSegmented(...)`, where `sum(weight_s)` is the
 //             segment list's own live weight sum (`1.0` at segmentCount == 0) -- the
-//             degree-1-homogeneous recovery (D-INSP-57) that matches relevance's own
+//             degree-1-homogeneous recovery that matches relevance's own
 //             channel-weight scaling at every weight vector, not a fixed `1 -`.
 //
 // For L2, the argmax does NOT materialize `f(x) = 1 - sqrt(x) / l2Scale` before comparing
-// (fourth adversarial strike, D-SLM1774-1778): `f` is exact over the reals but only
+// (fourth adversarial strike): `f` is exact over the reals but only
 // non-strictly decreasing once its output is rounded to `float32`, so two distinct raw
 // distances can round to one `f(x)` and the argmax's tie-break would then resolve the
 // collision instead of the (compressed-away) relevance difference. Instead the comparison
@@ -94,7 +94,7 @@ namespace superfaiss
 // sqrt(x) / l2Scale` applied to the winner's own `u_rel`/`mean_u_red` (the same pre-transform
 // ratios the comparison used, but not the quantity the L2 comparison itself compared); for
 // Dot and Cosine, the raw comparison operands. Both display outputs are floored uniformly for
-// every metric (D-SLM1779): `float32`, with `|value| < FLT_MIN` flushed to exactly `0.0f`, the
+// every metric: `float32`, with `|value| < FLT_MIN` flushed to exactly `0.0f`, the
 // codebase's cross-device subnormal convention. In selection order -- the values the caller
 // renders beside each result row.
 //

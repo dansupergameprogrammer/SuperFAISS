@@ -289,7 +289,7 @@ namespace
 		{
 			return Status::BadFormat;
 		}
-		// The archive is an untrusted medium (review M2, the T-062 idiom): bound the
+		// The archive is an untrusted medium (review M2, the trust-boundary idiom): bound the
 		// geometry BEFORE any byte-size arithmetic — the arena math multiplies the
 		// caller-controlled capacity and dims, and an unbounded pair is signed int64
 		// overflow (UB), not merely a failed allocation. paddedDims is capped at the
@@ -888,7 +888,7 @@ Status ScratchBank::Grow(int32_t newCapacity)
 
 	BindArena(arena, newCapacity);
 
-	// Index-preserving by construction (T-044 W4): rows, scales, tombstones, and the
+	// Index-preserving by construction: rows, scales, tombstones, and the
 	// retention arena copy straight across; nothing compacts, nothing renumbers.
 	std::memcpy(Rows_, oldRows,
 		static_cast<size_t>(count) * PaddedDims_ * ElementSize(Quant_));
@@ -1849,7 +1849,7 @@ Status ScratchBank::MeasureRecallLockedChannel(
 		}
 
 		// Reference top-k over the channel sub-range: per-channel cosine (dot over the
-		// sub-vector norm — the D-V2-1 contract), dot, or squared-L2, matching how the
+		// sub-vector norm — the per-channel cosine contract), dot, or squared-L2, matching how the
 		// segmented kernel scores the same channel-aligned segment.
 		refHits.Clear();
 		for (int32_t j = 0; j < count; ++j)

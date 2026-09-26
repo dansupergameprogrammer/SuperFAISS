@@ -27,7 +27,7 @@ inline float XdFloorDiversityLocal(double score)
 }
 
 // The fourth-adversarial-strike remedy (drift-and-diversity plan section 6.2, construction
-// B, D-SLM1778). `u = sqrt(x)/L`, the pre-transform ratio `f(x) = 1 - u` is built from.
+// B). `u = sqrt(x)/L`, the pre-transform ratio `f(x) = 1 - u` is built from.
 // Comparing `u` directly (double, never rounded to float32) removes the argmax's
 // compression by construction rather than shrinking it: two distinct float32 raw distances
 // `x_1 < x_2` promoted to double satisfy `sqrt(x_1)/L <= sqrt(x_2)/L` (double,
@@ -56,7 +56,7 @@ Status SelectDiverseMMR(
 	double* redundancyScratch,
 	int32_t* outSelectedIndices, float* outRelevance, float* outRedundancy)
 {
-	// Metric::Cosine's own recovery constant (section 6.2, D-INSP-57): the segment list's
+	// Metric::Cosine's own recovery constant (section 6.2): the segment list's
 	// own live weight sum, computed once per call -- the same list on every redundancy call
 	// for this selection, not recomputed per candidate or per step. `1.0` at the degenerate
 	// channelless case (segmentCount == 0 or segments == nullptr), matching
@@ -90,7 +90,7 @@ Status SelectDiverseMMR(
 		int32_t bestPos = -1;
 		int32_t bestIndex = 0;
 
-		// Metric::L2 path (construction B, D-SLM1778): the argmax compares in the
+		// Metric::L2 path (construction B): the argmax compares in the
 		// pre-transform u-domain, double precision, never rounded to float32.
 		// `bestURel`/`bestMeanURed` are the winning candidate's own ratios, saved here so
 		// the display values are computed once after the loop, from the same numbers the
@@ -102,7 +102,7 @@ Status SelectDiverseMMR(
 		// Metric::Dot/Metric::Cosine path. Neither metric applies a transform to relevance
 		// (no float32 compression risk exists on either -- confirmed, fourth adversarial
 		// strike, Control A). The DISPLAY value is floored uniformly for every metric
-		// (D-SLM1779, below).
+		// (below).
 		double bestScore = 0.0;
 		float bestRelevance = 0.0f;
 		float bestRedundancy = 0.0f;
@@ -131,11 +131,11 @@ Status SelectDiverseMMR(
 
 			// The one new redundancy term. ScoreXdPairSegmented is still called at every step
 			// regardless of lambda, so a non-Ok status propagates even at lambda == 1.0
-			// (D-SLM1782 -- redundancy carries weight zero there, but the call is
+			// (redundancy carries weight zero there, but the call is
 			// unconditional). Every earlier pair of this candidate was scored, and returned
 			// Ok, at the step right after its member was selected, so the first non-Ok status
 			// surfaces at the same step, and for the same candidate, as a full recomputation.
-			// The fork below gives the deferred D-SLM1780 `bestPos == -1` guard its landing
+			// The fork below gives the deferred `bestPos == -1` guard its landing
 			// site should it ever land: `candidateQueries[newestPos]` is the dereference.
 			if (newestPos >= 0)
 			{
@@ -237,7 +237,7 @@ Status SelectDiverseMMR(
 		// computed once, for the step's winner only, never for every candidate, and never
 		// the quantity the L2 comparison above used. Floored per the subnormal-floor
 		// convention, applied uniformly to BOTH display outputs for every metric
-		// (D-SLM1779 -- previously only outRedundancy was floored; outRelevance passed
+		// (previously only outRedundancy was floored; outRelevance passed
 		// through un-floored).
 		if (metric == Metric::L2)
 		{
