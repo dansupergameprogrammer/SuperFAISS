@@ -34,7 +34,9 @@ namespace detail
 
 	static bool DetectAvx2Fma()
 	{
-#if defined(__clang__) || defined(__GNUC__)
+		// clang-cl defines __clang__ but links no compiler-rt, which holds the
+		// __cpu_model that __builtin_cpu_supports reads; it takes the CPUID path.
+#if (defined(__clang__) || defined(__GNUC__)) && !defined(_MSC_VER)
 		return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
 #else
 		int32_t info1[4] = {};
