@@ -9,8 +9,8 @@ performance model that should shape your integration. The reference integration 
 
 ## 1. Build
 
-Any C++17 compiler. Compile `src/*.cpp` into your target; add `include/` to the include
-path. Non-negotiable flags (the shipped `CMakeLists.txt` applies them):
+A C++17 compiler (MSVC 19.30 or later; clang-cl, GCC, Clang, AppleClang). Compile
+`src/*.cpp` into your target; add `include/` to the include path. Non-negotiable flags (the shipped `CMakeLists.txt` applies them):
 
 | Concern | GCC / Clang | MSVC (cl.exe, 19.30+) | clang-cl |
 |---|---|---|---|

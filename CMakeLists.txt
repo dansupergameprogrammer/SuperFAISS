@@ -34,6 +34,13 @@ if(MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang"
 	set(SUPERFAISS_CLANG_CL ON)
 endif()
 
+# cl.exe's /fp:precise does not contract only from MSVC 19.30 (Visual Studio 2022) on;
+# see the determinism note below. clang-cl reports the MSVC version it emulates, not
+# its own, so the check applies to cl.exe only.
+if(MSVC AND NOT SUPERFAISS_CLANG_CL AND MSVC_VERSION LESS 1930)
+	message(FATAL_ERROR "SuperFAISS requires MSVC 19.30 or newer")
+endif()
+
 # Determinism: forbid FP contraction (implicit fused multiply-add would change rounding
 # and break scalar/SIMD bit-equality; the AVX2 path uses FMA *explicitly*, mirrored by
 # std::fma). cl.exe's /fp:precise does not contract from Visual Studio 2022 (MSVC
