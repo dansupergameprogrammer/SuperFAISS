@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/dansupergameprogrammer/superfaiss/actions/workflows/tests.yml/badge.svg)](https://github.com/dansupergameprogrammer/superfaiss/actions/workflows/tests.yml)
 
-**Current release: [v3.4.0](https://github.com/dansupergameprogrammer/superfaiss/releases/tag/v3.4.0)** — what each release added is in [CHANGELOG.md](CHANGELOG.md). Version markers in the feature list below record when a capability landed, not the current version.
+**Current release: [v3.4.3](https://github.com/dansupergameprogrammer/superfaiss/releases/tag/v3.4.3)** — what each release added is in [CHANGELOG.md](CHANGELOG.md). Version markers in the feature list below record when a capability landed, not the current version.
 
 Fast, deterministic, allocation-free k-nearest-neighbor search for game runtimes —
 over banks you bake in your pipeline or grow at play time. One bank answers many
@@ -14,7 +14,8 @@ stored, staleness-tracked number. Exact, bit-reproducible per device, and
 (opt-in) bit-identical across machines. Dependency-free C++17 — the standard library
 and nothing else.
 CI-verified on Windows x64, Linux x64, and macOS arm64 (NEON) — three compilers
-(MSVC, GCC, AppleClang) plus a ThreadSanitizer pass, on every push.
+(MSVC 19.30+, GCC, AppleClang) plus a ThreadSanitizer pass, on every push. Clang and
+clang-cl are also supported (see [Building](#building)).
 
 In plainer terms: games are full of *find the best match* problems — the animation pose
 that best continues this motion, the NPC memory most relevant to what just happened, the
@@ -76,7 +77,10 @@ reference reader/writer are in [FORMAT.md](docs/FORMAT.md).
 
 ## Building
 
-Any C++17 compiler, no dependencies. `build.bat` (MSVC), or CMake:
+A C++17 compiler, no dependencies. Supported compilers: MSVC 19.30 or later (Visual
+Studio 2022), clang-cl (`cmake -B build -T ClangCL` with Visual Studio, or
+`-DCMAKE_CXX_COMPILER=clang-cl`), GCC, Clang and AppleClang. The CI matrix above covers
+MSVC 19.30+, GCC and AppleClang. `build.bat` (MSVC), or CMake:
 
 ```
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && ./build/superfaiss_tests

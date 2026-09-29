@@ -9,6 +9,30 @@ per entry. Reconstructed from git history 2026-07-12.
 The format follows [Keep a Changelog](https://keepachangelog.com); this project versions
 by feature tier (minor = new capability, patch = fix), not strict SemVer of a public ABI.
 
+## [3.4.3] — 2026-09-29
+
+3.4.1 and 3.4.2 were SuperFAISS For Unreal Engine plugin releases; the core library goes
+from 3.4.0 to 3.4.3 so the two share one version line.
+
+### Fixed
+- **Builds with clang-cl.** CMake reports clang-cl as MSVC, so it was given only cl.exe's
+  switches: `kernels.cpp` lacked the SSE4.1 target feature and clang-cl rejected its
+  intrinsics, and CPU detection called `__builtin_cpu_supports`, whose `__cpu_model` lives
+  in a compiler-rt that clang-cl does not link. clang-cl now also gets
+  `/clang:-ffp-contract=off` (its `/fp:precise` contracts `a*b+c` into FMA, which the
+  determinism contract forbids) and `/clang:-msse4.2` on `kernels.cpp` for x64/X86, and CPU
+  detection takes the CPUID path cl.exe takes. cl.exe x64/X86, GCC and Clang command lines
+  are unchanged.
+- **CPUID detection checks the maximum basic leaf.** The CPUID path (cl.exe, clang-cl) now
+  confirms leaf 7 exists before reading its AVX2 bit.
+- **`/arch:AVX2` is applied only for x64/X86 targets**, not for ARM64 MSVC builds.
+
+### Changed
+- The minimum MSVC version is 19.30 (Visual Studio 2022): from that version on, cl.exe's
+  `/fp:precise` does not contract. CMake now stops with an error on an older cl.exe. The
+  build-flag tables in [docs/INTEGRATION.md](docs/INTEGRATION.md) and
+  [docs/DETERMINISM.md](docs/DETERMINISM.md) gain the clang-cl flags.
+
 ## [3.4.0] — 2026-09-24
 
 ### Added

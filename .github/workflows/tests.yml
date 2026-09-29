@@ -71,6 +71,30 @@ jobs:
           if ($text -notmatch "simd path: (sse|avx2)") { Write-Error "expected an x86 SIMD path"; exit 1 }
           if ($text -notmatch "cross-device hash:") { Write-Error "cross-device hash line missing"; exit 1 }
 
+  # The same suite built with clang-cl (the Visual Studio ClangCL toolset). CMake
+  # reports clang-cl as MSVC, so this job catches a flag or source path that only
+  # cl.exe was ever given: clang-cl must get -ffp-contract=off and -msse4.2 on top
+  # of the MSVC switches, and it takes the CPUID detection path.
+  windows-x64-clangcl:
+    needs: changes
+    runs-on: windows-latest
+    steps:
+      - if: needs.changes.outputs.code == 'true'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - if: needs.changes.outputs.code == 'true'
+        run: cmake -B build -T ClangCL
+      - if: needs.changes.outputs.code == 'true'
+        run: cmake --build build --config Release
+      - if: needs.changes.outputs.code == 'true'
+        shell: pwsh
+        run: |
+          $out = & build/Release/superfaiss_tests.exe
+          Write-Output $out
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $text = $out -join "`n"
+          if ($text -notmatch "simd path: (sse|avx2)") { Write-Error "expected an x86 SIMD path"; exit 1 }
+          if ($text -notmatch "cross-device hash:") { Write-Error "cross-device hash line missing"; exit 1 }
+
   linux-x64:
     needs: changes
     runs-on: ubuntu-latest
@@ -98,7 +122,7 @@ jobs:
           grep "cross-device hash:" test_output.txt > /dev/null || exit 1
           exit $status
 
-  # ThreadSanitizer over the whole suite — the scratch-bank storm test (T-V2-C1)
+  # ThreadSanitizer over the whole suite — the scratch-bank concurrency storm test
   # is the target: single-writer/lock-free-reader races surface here, not on
   # x86's forgiving memory model.
   linux-x64-tsan:
@@ -116,7 +140,7 @@ jobs:
 
   # GitHub macOS runners are Apple Silicon: this executes the NEON path on real ARM.
   #
-  # Cross-device proof (v2.2, plan 19.4): the suite computes the hit-list hash over
+  # Cross-device proof (v2.2): the suite computes the hit-list hash over
   # the COMMITTED fixture banks under every kernel path the hardware can force
   # (scalar/SSE4.1/AVX2 on x86, scalar/NEON here) and asserts it equals the pinned
   # golden in tests/xd_fixtures.h — so all runners agreeing with the pin proves any
