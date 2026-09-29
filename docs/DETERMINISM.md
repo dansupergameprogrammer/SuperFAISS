@@ -206,12 +206,20 @@ with no cross-device claim — and stands outside this contract.
 ## 3. Embedder obligations
 
 1. **Do not let your compiler contract the float math.** Implicit FMA contraction in
-   the scalar mirrors (or reassociation anywhere) breaks SIMD≡mirror equality. Build the library with `-ffp-contract=off` (GCC/Clang) or `/fp:precise` (MSVC) — the
-   shipped CMake does this. **Compile flags are the only reliable mechanism: under
+   the scalar mirrors (or reassociation anywhere) breaks SIMD≡mirror equality. Build
+   the library with `-ffp-contract=off` (GCC/Clang), `/fp:precise` (MSVC), or
+   `/fp:precise` **plus** `-ffp-contract=off` (clang-cl, passed as
+   `/clang:-ffp-contract=off`) — the shipped CMake does this. clang-cl maps
+   `/fp:precise` to clang's precise model, which *does* contract (`-ffp-contract=on`),
+   so `/fp:precise` alone is not enough there. cl.exe's `/fp:precise` does not contract
+   from Visual Studio 2022 (MSVC 19.30) on; earlier cl.exe versions could, so MSVC 19.30
+   is the minimum. **Compile flags are the only reliable mechanism: under
    clang fast-math, source-level pragmas (`float_control`, `clang fp contract(off)`,
    `STDC FP_CONTRACT`) do NOT stop backend fusion — verified at the compiler.** In
    Unreal Engine, set `FPSemantics = FPSemanticsMode.Precise` on the module that
-   compiles these sources. Ship a mirror-equality test in your integration; it is the
+   compiles these sources; an Unreal build that uses clang-cl as its Windows compiler
+   needs the same `-ffp-contract=off` on that module as well, so check the module's
+   compile line for it. Ship a mirror-equality test in your integration; it is the
    tripwire that catches a toolchain silently breaking this.
 2. **Respect the format's content rules** (zero pad lanes, finite values, non-negative
    scales) — validate at load with `ValidateBankData`, not per query.

@@ -9,14 +9,18 @@ performance model that should shape your integration. The reference integration 
 
 ## 1. Build
 
-Any C++17 compiler. Compile `src/*.cpp` into your target; add `include/` to the include
-path. Non-negotiable flags (the shipped `CMakeLists.txt` applies them):
+A C++17 compiler (MSVC 19.30 or later; clang-cl, GCC, Clang, AppleClang). Compile
+`src/*.cpp` into your target; add `include/` to the include path. Non-negotiable flags (the shipped `CMakeLists.txt` applies them):
 
-| Concern | GCC / Clang | MSVC |
-|---|---|---|
-| No implicit FP contraction (determinism) | `-ffp-contract=off` | `/fp:precise` |
-| SSE4.1 intrinsics baseline (x86) | `-msse4.2` on `kernels.cpp` | (implied by x64) |
-| AVX2 TU | nothing (`target` attributes) | `/arch:AVX2` on `kernels_avx2.cpp` |
+| Concern | GCC / Clang | MSVC (cl.exe, 19.30+) | clang-cl |
+|---|---|---|---|
+| No implicit FP contraction (determinism) | `-ffp-contract=off` | `/fp:precise` | `/fp:precise /clang:-ffp-contract=off` |
+| SSE4.1 intrinsics baseline (x86) | `-msse4.2` on `kernels.cpp` | (implied by x64) | `/clang:-msse4.2` on `kernels.cpp` (x64/X86 targets) |
+| AVX2 TU | nothing (`target` attributes) | `/arch:AVX2` on `kernels_avx2.cpp` (x64/X86 targets) | `/arch:AVX2` on `kernels_avx2.cpp` (x64/X86 targets) |
+
+clang-cl needs both contraction flags: it maps `/fp:precise` to clang's precise model,
+which contracts `a*b+c` into FMA. cl.exe's `/fp:precise` does not contract from Visual
+Studio 2022 (MSVC 19.30) on, which is the minimum MSVC version.
 
 If your build system compiles these sources under fast-math defaults (game engines
 usually do), you must override the *flags* for these translation units — source-level
@@ -27,8 +31,12 @@ mirror-equality test (`detail::DotF32 == detail::DotF32Mirror` over random input
 your own suite as the permanent tripwire.
 
 SIMD is selected per platform automatically (NEON on ARM, SSE4.1 on x86 with a runtime
-CPUID upgrade to AVX2+FMA, scalar anywhere else). There is no platform-specific code:
-if your platform has a C++17 toolchain, the library compiles.
+CPUID upgrade to AVX2+FMA, scalar anywhere else). Every source file is compiled on
+every platform (the x86 and ARM code sits behind preprocessor guards), so the only
+per-compiler setup is the flags in the table above. With those flags, a C++17
+toolchain compiles the library. The runtime CPU check differs by compiler: GCC and
+Clang (GNU frontend) call `__builtin_cpu_supports`, while cl.exe and clang-cl query
+CPUID directly, because clang-cl links no compiler-rt to back that builtin.
 
 ## 2. Memory seam
 
