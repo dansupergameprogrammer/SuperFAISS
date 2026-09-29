@@ -76,7 +76,10 @@ reference reader/writer are in [FORMAT.md](docs/FORMAT.md).
 
 ## Building
 
-Any C++17 compiler, no dependencies. `build.bat` (MSVC), or CMake:
+Any C++17 compiler, no dependencies. Supported compilers: GCC, Clang, AppleClang,
+MSVC 19.30 or later (Visual Studio 2022), and clang-cl (`cmake -B build -T ClangCL`
+with Visual Studio, or `-DCMAKE_CXX_COMPILER=clang-cl`). The CI matrix above covers
+MSVC, GCC and AppleClang. `build.bat` (MSVC), or CMake:
 
 ```
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && ./build/superfaiss_tests
