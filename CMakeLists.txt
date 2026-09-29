@@ -36,8 +36,10 @@ endif()
 
 # Determinism: forbid FP contraction (implicit fused multiply-add would change rounding
 # and break scalar/SIMD bit-equality; the AVX2 path uses FMA *explicitly*, mirrored by
-# std::fma). cl.exe's /fp:precise does not contract; clang-cl maps /fp:precise to
-# clang's precise model, which does (-ffp-contract=on), so clang-cl also gets
+# std::fma). cl.exe's /fp:precise does not contract from Visual Studio 2022 (MSVC
+# 19.30) on, which is therefore the minimum MSVC version; earlier cl.exe versions
+# could contract under /fp:precise. clang-cl maps /fp:precise to clang's precise
+# model, which does contract (-ffp-contract=on), so clang-cl also gets
 # -ffp-contract=off. /clang: passes an option to the clang driver verbatim.
 set(SUPERFAISS_CLANG_CL_OPTIONS)
 if(SUPERFAISS_CLANG_CL)
@@ -46,14 +48,17 @@ endif()
 
 if(MSVC)
 	target_compile_options(superfaiss PRIVATE /W4 /fp:precise ${SUPERFAISS_CLANG_CL_OPTIONS})
-	# VEX-encode the whole AVX2 TU so no SSE/AVX transition penalties occur. The
-	# functions are runtime-dispatched; the TU is never executed on non-AVX2 CPUs.
-	set_source_files_properties(src/kernels_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
-	# cl.exe compiles SSE4.1 intrinsics on the x64 baseline without a flag; clang-cl, like
-	# clang, needs the target feature enabled for the TU, or it rejects them. Keyed on the
-	# target architecture the compiler reports (x64 or X86), not the host processor.
-	if(SUPERFAISS_CLANG_CL AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID MATCHES "^(x64|X86)$")
-		set_source_files_properties(src/kernels.cpp PROPERTIES COMPILE_OPTIONS "/clang:-msse4.2")
+	# Both options below are keyed on the target architecture the compiler reports
+	# (x64 or X86), not the host processor: neither exists for an ARM64 target.
+	if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID MATCHES "^(x64|X86)$")
+		# VEX-encode the whole AVX2 TU so no SSE/AVX transition penalties occur. The
+		# functions are runtime-dispatched; the TU is never executed on non-AVX2 CPUs.
+		set_source_files_properties(src/kernels_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+		# cl.exe compiles SSE4.1 intrinsics on the x64 baseline without a flag; clang-cl,
+		# like clang, needs the target feature enabled for the TU, or it rejects them.
+		if(SUPERFAISS_CLANG_CL)
+			set_source_files_properties(src/kernels.cpp PROPERTIES COMPILE_OPTIONS "/clang:-msse4.2")
+		endif()
 	endif()
 else()
 	target_compile_options(superfaiss PRIVATE -Wall -Wextra -ffp-contract=off)
