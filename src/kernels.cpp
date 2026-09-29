@@ -39,6 +39,16 @@ namespace detail
 #if (defined(__clang__) || defined(__GNUC__)) && !defined(_MSC_VER)
 		return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
 #else
+		// Leaf 7 (read below for the AVX2 bit) exists only if the maximum basic leaf,
+		// reported in EAX of leaf 0, is at least 7. Above the maximum, Intel CPUs return
+		// the highest basic leaf's data instead, so EBX bit 5 would mean nothing.
+		// libgcc and compiler-rt make the same check.
+		int32_t info0[4] = {};
+		__cpuidex(info0, 0, 0);
+		if (info0[0] < 7)
+		{
+			return false;
+		}
 		int32_t info1[4] = {};
 		__cpuidex(info1, 1, 0);
 		const bool osxsave = (info1[2] & (1 << 27)) != 0;
